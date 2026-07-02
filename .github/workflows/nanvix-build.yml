@@ -1,0 +1,61 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+name: CI/CD Pipeline
+
+#==================================================================================================
+# Trigger Conditions
+#==================================================================================================
+
+on:
+  # PR verification only. Pushes/merges to the release branches are handled by
+  # the Release Pipeline (nanvix-release.yml), which builds stage 0 + stage 1
+  # and publishes the toolchain image. Keeping this workflow PR-only avoids a
+  # redundant stage-0 build on every merge.
+  pull_request:
+    types:
+      - 'opened'
+      - 'synchronize'
+      - 'reopened'
+      - 'ready_for_review'
+    branches:
+      - 'dev'
+      - 'nanvix/**'
+
+# Cancel previous running actions for the same PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/dev' }}
+
+#==================================================================================================
+# Environment Variables
+#==================================================================================================
+
+env:
+  # Directory where LLVM will be installed.
+  INSTALL_LOCATION: /opt/nanvix
+  # Token used by `z` to download the in-source Nanvix libc release (nanvix/nanvix
+  # is public, so the default GITHUB_TOKEN is sufficient) when building stage 1.
+  GH_TOKEN: ${{ github.token }}
+
+#==================================================================================================
+# Jobs
+#==================================================================================================
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # Build stage 0 + stage 1 and run the build-only smoke tests. The shared
+    # build/test sequence lives in the nanvix-build composite action so
+    # it stays in sync with the Release Pipeline (nanvix-release.yml).
+    - name: Build and test toolchain
+      uses: ./.github/actions/nanvix-build
+      with:
+        install-location: ${{ env.INSTALL_LOCATION }}
+        cache-key: ${{ runner.os }}-sccache
+        cache-restore-keys: ${{ runner.os }}-sccache

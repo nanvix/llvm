@@ -1,0 +1,79 @@
+name: nanvix-update
+
+on:
+  schedule:
+    # Runs daily at midnight PST (UTC-8). GitHub Actions cron uses UTC, so 08:00 UTC = 00:00 PST.
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+# Global environment variables for this workflow
+env:
+  # GitHub usernames (comma-separated for multiple) to assign to the update PR.
+  # DISPATCH_TOKEN (used below) is @ppenna's PAT, so the PR is authored by that
+  # account; GitHub forbids a PR author from reviewing their own PR, so we assign
+  # the user rather than request a review — matching the other nanvix update
+  # workflows (e.g. nanvix/nanvix verus-update, which uses `assignees: ppenna`).
+  PR_ASSIGNEES: ppenna
+
+jobs:
+  update-z:
+    name: Check and update z utility
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Run update command
+        id: update
+        env:
+          # Authenticate the GitHub API calls made by `./z update` so release
+          # metadata lookups use the higher authenticated rate limit rather than
+          # the shared unauthenticated one (which is easily exhausted on hosted
+          # runners and made this step fail intermittently).
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ./z update
+
+      # Open the pull request with an organization Personal Access Token
+      # (DISPATCH_TOKEN) instead of the default GITHUB_TOKEN. PRs opened by
+      # GITHUB_TOKEN / github-actions[bot] are treated as coming from an untrusted
+      # first-time contributor, so their `on: pull_request` CI runs are held in
+      # "Action required" awaiting manual maintainer approval. Authoring the PR
+      # with a write-access token makes the required CI checks run automatically
+      # (the merge still respects branch-protection reviews).
+      #
+      # DISPATCH_TOKEN is the org PAT (repo scope) shared by the nanvix update
+      # workflows; it belongs to @ppenna, so this pull request is authored by that
+      # account. A PR author cannot review or approve their own PR, so the user is
+      # added as an assignee (not a reviewer) below; a different maintainer — or an
+      # admin merge — must satisfy the branch-protection review requirement.
+      - name: Create branch and open Pull Request
+        if: steps.update.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.DISPATCH_TOKEN }}
+          commit-message: "chore(z): update Nanvix release to ${{ steps.update.outputs.tag }}"
+          branch: "update/nanvix-${{ steps.update.outputs.tag }}"
+          title: "Update Nanvix release to ${{ steps.update.outputs.tag }}"
+          body: |
+            This PR updates the `z` utility to pin the latest release of `nanvix/nanvix` (${{ steps.update.outputs.tag }}).
+
+            Generated automatically by the update workflow.
+          # Target the branch the workflow runs on (the default branch) instead
+          # of a hardcoded `dev`, so version bumps land on the active development
+          # line where CI actually runs.
+          base: ${{ github.ref_name }}
+          labels: automated,update
+          assignees: ${{ env.PR_ASSIGNEES }}

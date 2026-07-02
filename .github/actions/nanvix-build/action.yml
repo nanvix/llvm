@@ -1,0 +1,97 @@
+# Copyright(c) The Maintainers of Nanvix.
+# Licensed under the MIT License.
+
+name: Build Nanvix LLVM toolchain
+description: >
+  Builds and installs the Nanvix LLVM cross-toolchain (stage 0 compiler +
+  stage 1 runtimes/libc) and runs build-only smoke tests. Stage 1 downloads the
+  in-source Nanvix libc release, so the calling workflow must expose GH_TOKEN in
+  its environment.
+
+inputs:
+  install-location:
+    description: Directory where LLVM (and the staged sysroot) is installed.
+    required: true
+  release-name:
+    description: Optional release name passed to the stage 1 configure step.
+    required: false
+    default: ''
+  cache-key:
+    description: Primary sccache cache key.
+    required: true
+  cache-restore-keys:
+    description: Newline-separated sccache cache restore keys.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Restore sccache cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/sccache
+        key: ${{ inputs.cache-key }}
+        restore-keys: ${{ inputs.cache-restore-keys }}
+
+    - name: Enable Compiler Caching
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Install dependencies
+      shell: bash
+      run: sudo ./z setup
+
+    # Stage 0: build and install the Clang/LLD compiler (no runtimes, no libc).
+    - name: Configure LLVM (stage 0)
+      shell: bash
+      run: ./z configure --install-location=${{ inputs.install-location }} --stage=0
+
+    - name: Build LLVM (stage 0)
+      shell: bash
+      run: ./z build
+
+    - name: Install LLVM (stage 0)
+      shell: bash
+      run: ./z install
+
+    # Stage 1: build the runtimes (compiler-rt, libunwind, libc++/libc++abi)
+    # against the in-source Nanvix libc. `z` stages the libc/headers into the
+    # sysroot, downloading the nanvix/nanvix release when no local source tree is
+    # present (CI). This requires GH_TOKEN, provided by the calling workflow.
+    # Inputs are passed via env (not interpolated into the script) and the
+    # optional release name is appended only when provided.
+    - name: Configure LLVM (stage 1)
+      shell: bash
+      env:
+        INSTALL_LOCATION: ${{ inputs.install-location }}
+        RELEASE_NAME: ${{ inputs.release-name }}
+      run: |
+        args=(
+          --install-location="${INSTALL_LOCATION}"
+          --sysroot-location="${INSTALL_LOCATION}"
+          --stage=1
+        )
+        if [[ -n "${RELEASE_NAME}" ]]; then
+          args+=(--release-name="${RELEASE_NAME}")
+        fi
+        ./z configure "${args[@]}"
+
+    - name: Build LLVM (stage 1)
+      shell: bash
+      run: ./z build
+
+    - name: Install LLVM (stage 1)
+      shell: bash
+      run: ./z install
+
+    #----------------------------------------------------------------------------------------------
+    # Tests (build-only: verify artifacts + compile/link smoke tests)
+    #----------------------------------------------------------------------------------------------
+
+    - name: Verify toolchain artifacts
+      shell: bash
+      run: ./z verify
+
+    - name: Build smoke tests
+      shell: bash
+      run: ./z test
