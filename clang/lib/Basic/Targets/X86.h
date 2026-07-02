@@ -719,6 +719,18 @@ public:
   }
 };
 
+// x86-32 Nanvix target
+class LLVM_LIBRARY_VISIBILITY NanvixX86_32TargetInfo
+    : public NanvixTargetInfo<X86_32TargetInfo> {
+public:
+  NanvixX86_32TargetInfo(const llvm::Triple &Triple, const TargetOptions &Opts)
+      : NanvixTargetInfo<X86_32TargetInfo>(Triple, Opts) {
+    SizeType = UnsignedLong;
+    IntPtrType = SignedLong;
+    PtrDiffType = SignedLong;
+  }
+};
+
 // x86-64 generic target
 class LLVM_LIBRARY_VISIBILITY X86_64TargetInfo : public X86TargetInfo {
 public:
@@ -1088,6 +1100,14 @@ public:
       : OHOSTargetInfo<X86_64TargetInfo>(Triple, Opts) {
     LongDoubleFormat = &llvm::APFloat::IEEEquad();
   }
+};
+
+// x86_64 Nanvix target
+class LLVM_LIBRARY_VISIBILITY NanvixX86_64TargetInfo
+    : public NanvixTargetInfo<X86_64TargetInfo> {
+public:
+  NanvixX86_64TargetInfo(const llvm::Triple &Triple, const TargetOptions &Opts)
+      : NanvixTargetInfo<X86_64TargetInfo>(Triple, Opts) {}
 };
 } // namespace targets
 } // namespace clang

@@ -37,6 +37,7 @@
 #include "ToolChains/Managarm.h"
 #include "ToolChains/MinGW.h"
 #include "ToolChains/MipsLinux.h"
+#include "ToolChains/Nanvix.h"
 #include "ToolChains/NetBSD.h"
 #include "ToolChains/OHOS.h"
 #include "ToolChains/OpenBSD.h"
@@ -6885,6 +6886,9 @@ const ToolChain &Driver::getToolChain(const ArgList &Args,
       break;
     case llvm::Triple::Solaris:
       TC = std::make_unique<toolchains::Solaris>(*this, Target, Args);
+      break;
+    case llvm::Triple::Nanvix:
+      TC = std::make_unique<toolchains::Nanvix>(*this, Target, Args);
       break;
     case llvm::Triple::CUDA:
       TC = std::make_unique<toolchains::NVPTXToolChain>(*this, Target, Args);

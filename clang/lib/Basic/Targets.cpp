@@ -592,6 +592,8 @@ std::unique_ptr<TargetInfo> AllocateTarget(const llvm::Triple &Triple,
       return std::make_unique<HaikuX86_32TargetInfo>(Triple, Opts);
     case llvm::Triple::RTEMS:
       return std::make_unique<RTEMSX86_32TargetInfo>(Triple, Opts);
+    case llvm::Triple::Nanvix:
+      return std::make_unique<NanvixX86_32TargetInfo>(Triple, Opts);
     case llvm::Triple::ELFIAMCU:
       return std::make_unique<MCUX86_32TargetInfo>(Triple, Opts);
     case llvm::Triple::Hurd:
@@ -651,6 +653,8 @@ std::unique_ptr<TargetInfo> AllocateTarget(const llvm::Triple &Triple,
     }
     case llvm::Triple::Haiku:
       return std::make_unique<HaikuTargetInfo<X86_64TargetInfo>>(Triple, Opts);
+    case llvm::Triple::Nanvix:
+      return std::make_unique<NanvixX86_64TargetInfo>(Triple, Opts);
     case llvm::Triple::PS4:
       return std::make_unique<PS4OSTargetInfo<X86_64TargetInfo>>(Triple, Opts);
     case llvm::Triple::PS5:
