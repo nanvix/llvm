@@ -1,0 +1,2616 @@
+#!/bin/bash
+
+#
+# Utility for building development tools for Nanvix.
+#
+# Run './z help' for more information on how to use this utility.
+#
+# Overview
+#
+#   Self-contained utility for configuring, building, installing, and releasing
+#   the LLVM-based Nanvix cross-toolchain (Clang, LLD, and the C/C++ runtimes).
+#
+# Structure
+#
+#   The file is organized into the following sections, in order:
+#
+#     1. Utility Functions - Generic, reusable helpers for logging, OS/version
+#        detection, downloading and extracting archives, and reading values
+#        from TOML/Cargo files.
+#     2. Project Commands - The generic "z framework": configuration state,
+#        argument parsing, and the command implementations (setup, configure,
+#        build, install, release, update, show-config) plus the zmain dispatcher.
+#        These call the project-specific hooks below.
+#     3. Z Constants - Project identity and requirements (project name, required
+#        build tools with minimum versions, and required system packages).
+#     4. Project-Specific Constants/Functions - The LLVM/Nanvix specialization:
+#        the download_steps, configure_steps, build_steps, install_steps and
+#        update_steps hooks invoked by the z framework.
+#     5. Update Support - Helpers that query GitHub release metadata and rewrite
+#        the pinned dependency versions/tags in this very file.
+#     6. Test Support - Build-only smoke tests that verify installed artifacts
+#        and that minimal C/C++ programs compile and link for the Nanvix target.
+#     7. Main Script - Entry point: intercepts the extra 'verify'/'test'
+#        commands, then delegates to zmain.
+#
+# How It Works
+#
+#   Running './z COMMAND [OPTIONS]' invokes zmain, which validates the host OS,
+#   checks that the required tools are present, and dispatches to the matching
+#   command. The 'configure' command saves the chosen options (target, install
+#   and sysroot locations, stage, parallelism, release name) to a '.z.config'
+#   file; subsequent commands (build, install, release, show-config) reload that
+#   saved configuration so they operate consistently.
+#
+#   Builds are staged:
+#     - Stage 0 builds the compiler only (Clang + LLD), no runtimes/sysroot.
+#     - Stage 1 stages the Nanvix libc into the sysroot and builds the runtimes
+#       (compiler-rt, libunwind, libc++, libc++abi) with the stage 0 compiler.
+#
+# Commands
+#
+#   Run './z help' for the full list of commands and options. In addition to
+#   the standard z framework commands, this script adds two build-only commands
+#   handled before dispatch: 'verify' (check installed artifacts) and 'test'
+#   (compile/link C and C++ smoke tests for the Nanvix target).
+#
+# Relevant Environment Variables
+#
+#   - Z_TARGET                Target architecture.
+#   - Z_STAGE                 Build stage.
+#   - Z_INSTALL_LOCATION      Installation directory.
+#   - Z_SYSROOT_LOCATION      Sysroot directory.
+#   - Z_RELEASE_NAME          Release name.
+#   - Z_NANVIX_SRC            Path to a local Nanvix source tree providing
+#                             libc/headers.
+#   - Z_NANVIX_RELEASE_TAG    Nanvix release tag to download when no source tree
+#                             is available (e.g. in CI).
+#
+# shellcheck disable=SC2329
+# shellcheck disable=SC2317
+# shellcheck disable=SC2034
+
+#==================================================================================================
+
+# Fast fail on errors, unset variables, and pipe failures.
+set -euo pipefail
+
+#==================================================================================================
+# Utility Functions
+#==================================================================================================
+
+#==================================================================================================
+# Logging
+#==================================================================================================
+
+# Colors
+readonly RED='\033[0;31m'    # Red
+readonly GREEN='\033[0;32m'  # Green
+readonly YELLOW='\033[0;33m' # Yellow
+readonly NC='\033[0m'        # No Color
+
+#
+# Description
+#
+#   Prints an error message on stderr.
+#
+# Parameters
+#
+#   $1 - The error message to print.
+#
+# Usage Example
+#
+#   print_error "Print an error message."
+#
+print_error() {
+    printf "%b\n" "${RED}[ERROR] ${1}${NC}" >&2
+}
+
+#
+# Description
+#
+#   Prints a success message on stdout.
+#
+# Parameters
+#
+#   $1 - The success message to print.
+#
+# Usage Example
+#
+#   print_success "Print a success message."
+#
+print_success() {
+    printf "%b\n" "${GREEN}[SUCCESS] ${1}${NC}"
+}
+
+#
+# Description
+#
+#   Prints a message on stdout.
+#
+# Parameters
+#
+#   $1 - The message to print.
+#
+# Usage Example
+#
+#   print_info "Print an informational message."
+#
+print_info() {
+    printf "%s\n" "[INFO] ${1}"
+}
+
+#
+# Description
+#
+#   Prints a warning message on stderr.
+#
+# Parameters
+#
+#   $1 - The warning message to print.
+#
+# Usage Example
+#
+#   print_warning "Print a warning message."
+#
+print_warning() {
+    printf "%b\n" "${YELLOW}[WARN] ${1}${NC}" >&2
+}
+
+#
+# Description
+#
+#  Prints a panic error message on stderr and exits with status 1.
+#
+# Parameters
+#
+#   $1 - The panic error message to print.
+#
+# Usage Example
+#
+#   print_panic "Print a panic error message and exit."
+#
+panic() {
+    printf "%b\n" "${RED}[PANIC] ${1}${NC}" >&2
+    exit 1
+}
+
+#==================================================================================================
+# System
+#==================================================================================================
+
+#
+# Description
+#
+#  Checks if the current user is the root user.
+#
+# Return Value
+#
+#   - Returns 0 (true) if the current user is root.
+#   - Returns 1 (false) otherwise.
+#
+# Usage Example
+#
+#   is_root_user && echo "Running as root" || echo "Not running as root"
+#
+is_root_user() {
+    [[ $EUID -eq 0 ]]
+}
+
+#
+# Description
+#
+#   Gets the OS ID from /etc/os-release.
+#
+# Return Value
+#
+#   - On success, a string containing the OS ID (e.g., "ubuntu", "debian").
+#   - On failure, returns a non-zero status.
+#
+# Usage Example
+#
+#   os_id=$(get_os_id)
+#
+get_os_id() {
+    # Check if /etc/os-release file does not exist.
+    if [[ ! -f /etc/os-release ]]; then
+        print_error "Cannot determine OS version."
+        return 1
+    fi
+
+    # Source /etc/os-release in a subshell so shell quoting is handled
+    # (this avoids exporting variables into the caller shell).
+    local os_id
+    os_id=$( . /etc/os-release 2>/dev/null; printf '%s' "${ID:-}" )
+
+    # Trim surrounding whitespace just in case.
+    os_id=$(printf '%s' "$os_id" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+    # If ID is empty, try the ID_LIKE field (take the first token).
+    if [[ -z "$os_id" ]]; then
+        local id_like
+        id_like=$( . /etc/os-release 2>/dev/null; printf '%s' "${ID_LIKE:-}" )
+        id_like=$(printf '%s' "$id_like" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        if [[ -n "$id_like" ]]; then
+            # ID_LIKE can be space-separated; use the first entry.
+            os_id=$(printf '%s' "$id_like" | awk '{print $1}')
+        fi
+    fi
+
+    # Check if OS ID was not extracted successfully.
+    if [[ -z "$os_id" ]]; then
+        print_error "Could not extract OS ID from '/etc/os-release'."
+        return 1
+    fi
+
+    printf '%s\n' "$os_id"
+}
+
+#
+# Description
+#
+#   Gets the OS VERSION_ID from /etc/os-release.
+#
+# Return Value
+#
+#   - On success, a string containing the OS VERSION_ID (e.g., "20.04", "10").
+#   - On failure, returns a non-zero status.
+#
+# Usage Example
+#
+#   os_version_id=$(get_os_version_id)
+#
+get_os_version_id() {
+    # Check if /etc/os-release file does not exist.
+    if [[ ! -f /etc/os-release ]]; then
+        print_error "Cannot determine OS version."
+        return 1
+    fi
+
+    # Source /etc/os-release in a subshell so shell quoting is handled.
+    local os_version_id
+    os_version_id=$( . /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" )
+
+    # Trim surrounding whitespace from extracted value.
+    os_version_id=$(printf '%s' "$os_version_id" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+    # If VERSION_ID is empty, try falling back to VERSION and extract numeric part.
+    if [[ -z "$os_version_id" ]]; then
+        local version_raw
+        version_raw=$( . /etc/os-release 2>/dev/null; printf '%s' "${VERSION:-}" )
+        version_raw=$(printf '%s' "$version_raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        if [[ -n "$version_raw" ]]; then
+            os_version_id=$(printf '%s' "$version_raw" | grep -oE '[0-9]+(\.[0-9]+)*' | head -n1 || true)
+        fi
+    fi
+
+    # Check if VERSION_ID was not extracted successfully.
+    if [[ -z "$os_version_id" ]]; then
+        print_error "Could not extract VERSION_ID from '/etc/os-release'."
+        return 1
+    fi
+
+    printf '%s\n' "$os_version_id"
+}
+
+#==================================================================================================
+# Versioning
+#==================================================================================================
+
+#
+# Description
+#
+#   Normalizes a version string to have 3 parts (e.g., "4.3" -> "4.3.0").
+#
+# Parameters
+#
+#   $1 - The version string to normalize.
+#
+# Return Value
+#
+#   - On success, a string containing the normalized version in the format MAJOR.MINOR.PATCH.
+#   - On failure, returns a non-zero status.
+#
+# Usage Example
+#
+#   normalized_version=$(normalize_version "4.3")
+#
+normalize_version() {
+    local version="$1"
+
+    # Check if version string is empty.
+    if [[ -z "$version" ]]; then
+        print_error "normalize_version: empty version."
+        return 1
+    fi
+
+    local parts=0
+    IFS='.' read -ra arr <<< "$version"
+    parts=${#arr[@]}
+    if (( parts < 3 )); then
+        while (( parts < 3 )); do
+            version="${version}.0"
+            ((parts++))
+        done
+    fi
+    printf '%s\n' "$version"
+}
+
+#
+# Description
+#
+#   Compares two version strings (e.g., "13.3.0" vs "13.2.5").
+#
+# Parameters
+#
+#   $1 - The first version string to compare.
+#   $2 - The second version string to compare.
+#
+# Return Value
+#
+#   - On success, returns 0 (true) if version1 is greater than or equal to version2,
+#     and returns 1 (false) if version1 is less than version2.
+#   - On failure, returns a non-zero status.
+#
+# Usage Example
+#
+#   if compare_version "13.3.0" "13.2.5"; then
+#       echo "Version 13.3.0 is greater than or equal to 13
+#   else
+#       echo "Version 13.3.0 is less than 13.2.
+#   fi
+#
+compare_version() {
+    local version1="$1"
+    local version2="$2"
+
+    # Split versions into arrays
+    IFS='.' read -ra v1_parts <<< "$version1"
+    IFS='.' read -ra v2_parts <<< "$version2"
+
+    # Pad arrays to same length with zeros
+    local max_length=$(( ${#v1_parts[@]} > ${#v2_parts[@]} ? ${#v1_parts[@]} : ${#v2_parts[@]} ))
+
+    local i
+
+    # Default to 0 for missing version parts to ensure proper comparison (e.g., "4.3" vs "4.3.0").
+    for ((i=0; i<max_length; i++)); do
+        local part1=${v1_parts[i]:-0}
+        local part2=${v2_parts[i]:-0}
+
+        # Ignore non-digit suffixes (e.g., rc1) by keeping only the leading digits.
+        part1=${part1%%[^0-9]*}
+        part2=${part2%%[^0-9]*}
+        part1=${part1:-0}
+        part2=${part2:-0}
+
+        # Use base 10 to avoid octal interpretations (leading zeros).
+        if ((10#${part1} > 10#${part2})); then
+            return 0
+        elif ((10#${part1} < 10#${part2})); then
+            return 1
+        fi
+    done
+
+    # versions are equal.
+    return 0
+}
+
+#==================================================================================================
+# Tools
+#==================================================================================================
+
+#
+# Get the version of a tool.
+#
+# Parameters
+#   - $1 Tool name.
+#
+# Returns:
+#   - On success, the version string of the tool.
+#   - On failure, returns a non-zero status.
+#
+# Example:
+#
+#   get_tool_version "gcc"
+#
+get_tool_version() {
+    local tool="$1"
+    local version
+    local output
+
+    # Ensure a tool was provided.
+    if [[ -z "$tool" ]]; then
+        print_error "get_tool_version: no tool specified."
+        return 1
+    fi
+
+    # If the command isn't available, fail early.
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        print_error "'${tool}' is not installed."
+        return 1
+    fi
+
+    case "$tool" in
+        gcc | make | wget | zip)
+            output=$("$tool" --version 2>&1) || output=$("$tool" -v 2>&1) || output=$("$tool" -V 2>&1) || true
+            ;;
+        unzip)
+            output=$("$tool" 2>&1) || true
+            ;;
+        *)
+            # Try common version invocations. Fall back to --help if none print a version.
+            output=$("$tool" --version 2>&1) || output=$("$tool" -v 2>&1) || output=$("$tool" -V 2>&1) || output=$("$tool" version 2>&1) || output=$("$tool" --help 2>&1) || true
+            ;;
+    esac
+
+    # Extract version: allow 1 to 3 numeric parts (e.g., 1, 1.2, 1.2.3).
+    version=$(printf '%s' "$output" | grep -oE '[0-9]+(\.[0-9]+){0,2}' | head -n1)
+
+    # Check if version is empty.
+    if [[ -z "$version" ]]; then
+        print_error "Unable to determine '${tool}' version."
+        return 1
+    fi
+
+    printf '%s\n' "$version"
+}
+
+#
+# Description
+#
+#   Downloads a zip archive to /tmp and optionally verifies its SHA256 checksum.
+#
+# Parameters
+#  - $1 URL of the dependency to download
+#  - $2 (Optional) Expected SHA256 checksum (with or without "sha256:" prefix)
+#
+# Returns Value
+#
+#   - On success, the path to the downloaded file.
+#   - On failure, returns a non-zero status.
+#
+# Usage Example
+#
+#   file_path=$(download "https://example.com/foo.zip" "sha256:...")
+#
+download() {
+    local dependency_url="$1"
+    local expected_checksum="${2:-}"
+
+    if [[ -z "$dependency_url" ]]; then
+        print_error "download requires URL parameter"
+        return 1
+    fi
+
+    # Generate temporary file name based on URL
+    local filename
+    filename=$(basename "$dependency_url")
+    local temp_file="/tmp/${filename}"
+
+
+    # Download dependency, if it does not already exist.
+    if [[ ! -f "$temp_file" ]]; then
+        wget -q "$dependency_url" -O "$temp_file" || {
+            print_error "Failed to download from $dependency_url"
+            return 1
+        }
+    fi
+
+    # Verify the checksum of the downloaded file, if provided.
+    if [[ -n "$expected_checksum" ]]; then
+        # Remove "sha256:" prefix if present
+        local clean_checksum="${expected_checksum#sha256:}"
+        local actual_checksum
+        actual_checksum=$(sha256sum "$temp_file" | awk '{print $1}')
+
+        if [[ "$actual_checksum" != "$clean_checksum" ]]; then
+            print_error "Checksum verification failed for $temp_file"
+            return 1
+        fi
+    fi
+
+    # Return path to downloaded file
+    printf '%s\n' "$temp_file"
+}
+
+#
+# Description
+#
+#   Extracts a zip archive to a given location and fixes ownership of the extracted files.
+#
+# Parameters
+#
+#  - $1 Path to the zip file
+#  - $2 Extract location directory
+#
+# Usage Example
+#
+#   extract_zip "/tmp/foo.zip" "/opt/foo" && echo "Extraction succeeded" || echo "Extraction failed"
+#
+extract_zip() {
+    local zip_file="$1"
+    local extract_location="$2"
+
+    # Check if any parameter is missing.
+    if [[ -z "$zip_file" || -z "$extract_location" ]]; then
+        print_error "extract_zip requires zip file and extract location parameters"
+        return 1
+    fi
+
+    print_info "Extracting ${zip_file} to $extract_location"
+    # Attempt to create the extract directory if it does not exist.
+    mkdir -p "$extract_location" || {
+        print_error "Failed to create extract directory '${extract_location}'"
+        return 1
+    }
+
+    unzip -q "$zip_file" -d "$extract_location" || {
+        print_error "Failed to extract '${zip_file}' to '${extract_location}'"
+        return 1
+    }
+
+    # Fix ownership of the extracted files.
+    print_info "Fixing ownership of the extracted files..."
+    if ! chown -R "$(id -u):$(id -g)" "$extract_location"; then
+        print_warning "Could not change ownership of extracted files in '$extract_location'. You may need to adjust permissions manually."
+    fi
+
+    return 0
+}
+
+#
+# Description
+#
+#   Extracts a .tar.bz2 (or .tbz/.tbz2) archive to a given location and fixes ownership of the extracted files.
+#
+# Parameters
+#
+#  - $1 Path to the tar.bz2 file
+#  - $2 Extract location directory
+#
+# Usage Example
+#
+#   extract_tar_bz2 "/tmp/foo.tar.bz2" "/opt/foo" && echo "Extraction succeeded" || echo "Extraction failed"
+#
+extract_tar_bz2() {
+    local tar_file="$1"
+    local extract_location="$2"
+
+    # Check if any parameter is missing.
+    if [[ -z "$tar_file" || -z "$extract_location" ]]; then
+        print_error "extract_tar_bz2 requires tar file and extract location parameters"
+        return 1
+    fi
+
+    # Check that the archive exists.
+    if [[ ! -f "$tar_file" ]]; then
+        print_error "Tar archive '$tar_file' does not exist."
+        return 1
+    fi
+
+    print_info "Extracting ${tar_file} to $extract_location"
+    # Attempt to create the extract directory if it does not exist.
+    mkdir -p "$extract_location" || {
+        print_error "Failed to create extract directory '${extract_location}'"
+        return 1
+    }
+
+    # Extract using tar. Support bzip2-compressed tarballs (.tar.bz2, .tbz, .tbz2).
+    if ! tar -xjf "$tar_file" -C "$extract_location" >/dev/null 2>&1; then
+        print_error "Failed to extract '${tar_file}' to '${extract_location}'"
+        return 1
+    fi
+
+    # Fix ownership of the extracted files.
+    print_info "Fixing ownership of the extracted files..."
+    if ! chown -R "$(id -u):$(id -g)" "$extract_location"; then
+        print_warning "Could not change ownership of extracted files in '$extract_location'. You may need to adjust permissions manually."
+    fi
+
+    return 0
+}
+
+#
+# Description
+#
+#   Enables compilation caching using sccache, if available.
+#
+# Return Value
+#
+#   - Returns 0 (true) if sccache was found and caching enabled.
+#   - Returns 1 (false) if sccache is not available and caching was not enabled.
+#
+# Usage Example
+#
+#   enable_compilation_caching && echo "Caching enabled" || echo "Caching not enabled"
+#
+# Notes
+#
+#   - This function may modify the CC, CXX, and RUSTC_WRAPPER environment variables.
+#
+enable_compilation_caching() {
+    if command -v sccache >/dev/null 2>&1; then
+        export CC="sccache gcc"
+        export CXX="sccache g++"
+        export RUSTC_WRAPPER="sccache"
+        return 0
+    else
+        return 1
+    fi
+}
+
+#==================================================================================================
+# Rust
+#==================================================================================================
+
+#
+# Description
+#
+#   Gets the current version from a Cargo.toml file.
+#
+# Parameters
+#
+#   $1 - The path to the Cargo.toml file.
+#
+# Return Value
+#
+#   - On success, a string containing the current version in the format MAJOR.MINOR.PATCH.
+#   - On failure, returns a non-zero status.
+#
+# Usage Example
+#
+#   cargo_toml_version=$(get_cargo_toml_version "path/to/Cargo.toml")
+#
+get_cargo_toml_version() {
+    local cargo_toml="$1"
+
+    # Check if the target file does not exist.
+    if [[ ! -f "$cargo_toml" ]]; then
+        print_error "$cargo_toml does not exist."
+        return 1
+    fi
+
+    # Check if target file is not a toml file.
+    if [[ "${cargo_toml##*.}" != "toml" ]]; then
+        print_error "$cargo_toml is not a toml file."
+        return 1
+    fi
+
+    local cargo_toml_version
+    cargo_toml_version=$(awk -F'=' '
+        /^\[package\]/{ in_pkg=1; next }
+        /^\[/{ in_pkg=0 }
+        in_pkg && $1 ~ /version[[:space:]]*/ {
+            v=$2
+            gsub(/^[[:space:]]+|[[:space:]]+$/,"",v)
+            gsub(/^"|"$/,"",v)
+            print v
+            exit
+        }
+    ' "$cargo_toml")
+
+    # Check if version was not extracted successfully.
+    if [[ -z "$cargo_toml_version" ]]; then
+        print_error "Could not extract version from ${cargo_toml}."
+        return 1
+    fi
+
+    printf '%s\n' "$cargo_toml_version"
+}
+
+#
+# Description
+#
+#   Reads a value from a simple, single-level TOML file with key = value pairs.
+#
+# Parameters
+#
+#   $1 - The path to the TOML file.
+#   $2 - The key to get the value for.
+#
+# Return Value
+#
+#   - On success, a string containing the value for the given key.
+#   - On failure, returns a non-zero status.
+#
+# Usage Example
+#
+#   foobar=$(get_value_from_toml "config.toml" "foobar")
+#
+get_value_from_toml() {
+    local toml_path=$1
+    local toml_key=$2
+    local val
+
+    # Check if the target file does not exist.
+    if [[ ! -f "$toml_path" ]]; then
+        print_error "'${toml_path}' does not exist."
+        return 1
+    fi
+
+    # Escape the key for use in a regex
+    local key_escaped
+    key_escaped=$(printf '%s' "$toml_key" | sed 's/[][\\/.^$*]/\\&/g')
+
+    # Match quoted (single/double) or unquoted values; return first match only.
+    val="$(sed -nE "s/^[[:space:]]*${key_escaped}[[:space:]]*=[[:space:]]*(\"([^\"]*)\"|'([^']*)'|([^[:space:]]+)).*/\2\3\4/p" "$toml_path" | head -n1)"
+
+    if [[ -n "$val" ]] ;then
+        printf '%s' "$val"
+    else
+        print_error "Could not extract '${toml_key}' from '${toml_path}'."
+        return 1
+    fi
+}
+
+#==================================================================================================
+# Project Commands
+#==================================================================================================
+
+# Project directory.
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Name for project build command.
+readonly BUILD_CMD_NAME="build"
+# Default name for peojct configure command.
+readonly CONFIGURE_CMD_NAME="configure"
+# Name for project help command.
+readonly HELP_CMD_NAME="help"
+# Name for project install command.
+readonly INSTALL_CMD_NAME="install"
+# Name for project release command.
+readonly RELEASE_CMD_NAME="release"
+# Name for project setup command.
+readonly SETUP_CMD_NAME="setup"
+# Name for show config command.
+readonly SHOW_CONFIG_CMD_NAME="show-config"
+# Name for project update command.
+readonly UPDATE_CMD_NAME="update"
+
+# Name for install location option.
+readonly INSTALL_LOCATION_OPT_NAME="--install-location"
+# Name for parallel build option.
+readonly PARALLEL_BUILD_OPT_NAME="--parallel-build"
+# Name for release name option.
+readonly RELEASE_NAME_OPT_NAME="--release-name"
+# Name for stage option.
+readonly STAGE_OPT_NAME="--stage"
+# Name for sysroot location option.
+readonly SYSROOT_LOCATION_OPT_NAME="--sysroot-location"
+
+# Directory for generated files that must not be tracked by git (the saved
+# build configuration and the release tarball). This is the only path that
+# needs to be listed in .gitignore.
+readonly Z_OUT_DIR="${PROJECT_DIR}/.nanvix/out"
+
+# Configuration file path
+readonly Z_CONFIG_FILE="${Z_OUT_DIR}/.z.config"
+
+# ID of supported OS
+readonly SUPPORTED_OS_ID="ubuntu"
+# Version of supported OS
+readonly SUPPORTED_OS_VERSION="24.04"
+
+# Default target value.
+readonly DEFAULT_TARGET="i686-nanvix"
+# Default build stage.
+readonly DEFAULT_STAGE="0"
+# Default install location.
+readonly DEFAULT_INSTALL_LOCATION="${HOME}/nanvix"
+# Default sysroot location.
+readonly DEFAULT_SYSROOT_LOCATION=""
+
+# Target.
+Z_TARGET="${DEFAULT_TARGET}"
+# Build stage.
+Z_STAGE="${DEFAULT_STAGE}"
+# Install location.
+Z_INSTALL_LOCATION="$DEFAULT_INSTALL_LOCATION"
+# Number of parallel build jobs.
+Z_PARALLEL_BUILD=""
+# Release name.
+Z_RELEASE_NAME=
+# Sysroot location.
+Z_SYSROOT_LOCATION="$DEFAULT_SYSROOT_LOCATION"
+
+#
+# Description
+#
+#   Returns the default release name for the project.
+#
+# Return Value
+#
+#   A string containing the default release name.
+#
+# Usage Example
+#
+#   default_release_name=$(get_default_release_name)
+#
+_get_default_release_name() {
+    local z_project_name
+
+    # Check if Z_PROJECT_NAME is set.
+    if [[ -z "${Z_PROJECT_NAME:-}" ]]; then
+        # If not set, fall back to using the project directory name.
+        z_project_name=$(basename "$PROJECT_DIR")
+    else
+        z_project_name="${Z_PROJECT_NAME}"
+    fi
+
+    printf '%s\n' "nanvix-${z_project_name,,}"
+}
+
+#
+# Description
+#
+#   Creates the build directory, if the project uses one.
+#
+# Parameters
+#
+#   - $1: Project build directory.
+#
+# Return Value
+#
+#   - On success, returns zero.
+#   - On failure, returns non-zero.
+#
+# Usage Example
+#
+#   _create_build_directory "/path/to/build"
+#
+_create_build_directory() {
+    local project_build_dir=$1
+
+    # Create build directory if and only if the project uses one.
+    if [[ -n "${project_build_dir}" ]]; then
+        mkdir -p "${project_build_dir}" || {
+            print_error "Failed to create build directory"
+            return 1
+        }
+    fi
+
+    return 0
+}
+
+#
+# Description
+#
+#   Enters the build directory, if any.
+#
+# Parameters
+#
+#   - $1: Project build directory.
+#
+# Return Value
+#
+#   - On success, returns zero.
+#   - On failure, returns non-zero.
+#
+# Usage Example
+#
+#   _enter_build_directory "/path/to/build"
+#
+_enter_build_directory() {
+    local project_build_dir=$1
+
+    # Enter build directory if and only if the project uses one.
+    if [[ -n "${project_build_dir}" ]]; then
+        pushd "${project_build_dir}" || {
+            print_error "failed to enter directory '${project_build_dir}'"
+            return 1
+        }
+    fi
+
+    return 0
+}
+
+#
+# Description
+#
+#   Leaves the build directory, if any was entered.
+#
+# Parameters
+#
+#   - $1: Project build directory.
+#
+# Return Value
+#
+#   - On success, returns zero.
+#   - On failure, returns non-zero.
+#
+# Usage Example
+#
+#   _leave_build_directory "/path/to/build"
+#
+_leave_build_directory() {
+    local project_build_dir=$1
+
+    # Leave build directory if and only if the project uses one.
+    if [[ -n "${project_build_dir}" ]]; then
+        popd || {
+            print_error "failed to leave directory '${project_build_dir}'"
+            return 1
+        }
+    fi
+
+    return 0
+}
+
+#
+# Description
+#
+#   Installs required system packages to build the project.
+#
+# Global Variables
+#
+#   - Z_PROJECT_NAME: Name of the project (for logging purposes).
+#   - Z_PROJECT_REQUIRED_PACKAGES: Array of required system packages to install.
+#
+# Return Value
+#
+#  - On success, returns zero.
+#  - On failure, returns non-zero.
+#
+# Usage Example
+#
+#  _setup_project && echo "Success" || echo "Failure"
+#
+_setup_project() {
+    print_info "Setting up required system packages for ${Z_PROJECT_NAME}..."
+
+    # Check if running as root
+    if [[ $EUID -eq 0 ]]; then
+        print_info "Running as root - proceeding with package installation"
+    else
+        print_info "Checking if sudo is available..."
+        if ! command -v sudo >/dev/null 2>&1; then
+            print_error "sudo is not available"
+            return 1
+        fi
+        print_info "Will use sudo for package installation"
+    fi
+
+    # Update package list
+    print_info "Updating package list..."
+    if [[ $EUID -eq 0 ]]; then
+        apt-get update
+    else
+        sudo apt-get update
+    fi
+
+    # Install missing packages from Z_PROJECT_REQUIRED_PACKAGES
+    print_info "Installing packages: ${Z_PROJECT_REQUIRED_PACKAGES[*]}"
+    if [[ $EUID -eq 0 ]]; then
+        apt-get install -y "${Z_PROJECT_REQUIRED_PACKAGES[@]}"
+    else
+        sudo apt-get install -y "${Z_PROJECT_REQUIRED_PACKAGES[@]}"
+    fi
+
+    return 0
+}
+
+#
+# Description
+#
+#   Installs the project.
+#
+# Global Variables
+#
+#   - Z_PROJECT_NAME: Name of the project (for logging purposes).
+#   - INSTALL_LOCATION: Directory where the project will be installed.
+#
+# Return Value
+#
+#  - On success, returns zero.
+#  - On failure, returns non-zero.
+#
+# Usage Example
+#
+#  install && echo "Success" || echo "Failure"
+#
+_install_project() {
+    echo "Installing ${Z_PROJECT_NAME} for Nanvix..."
+    echo "Install location: ${Z_INSTALL_LOCATION}"
+
+    _enter_build_directory "$Z_PROJECT_BUILD_DIR" || {
+        print_error "Failed to enter build directory"
+        return 1
+    }
+
+    local old_path="$PATH"
+
+    # If sysroot location is set add it to PATH. Otherwise, add install location.
+    local sysroot_location="${Z_SYSROOT_LOCATION:-${Z_INSTALL_LOCATION}}"
+    export PATH="${sysroot_location}/bin:${PATH}"
+
+    install_steps || {
+        export PATH="${old_path}"
+        return 1
+    }
+
+    export PATH="${old_path}"
+
+    _leave_build_directory "$Z_PROJECT_BUILD_DIR" || {
+        print_error "Failed to leave build directory"
+        return 1
+    }
+
+    return 0
+}
+
+#
+# Description
+#
+#   Builds the project.
+#
+# Global Variables
+#
+#   - Z_PROJECT_NAME: Name of the project (for logging purposes).
+#   - TARGET: Build target (for logging purposes).
+#   - Z_PROJECT_BUILD_DIR: Directory where the project is built.
+#
+# Return Value
+#
+#  - On success, returns zero.
+#  - On failure, returns non-zero.
+#
+# Usage Example
+#
+#  build && echo "Success" || echo "Failure"
+#
+_build_project() {
+    echo "Building ${Z_PROJECT_NAME} for ${Z_TARGET}..."
+
+    local parallel_build_option
+    if [[ -n "$Z_PARALLEL_BUILD" ]]; then
+        if ! [[ "$Z_PARALLEL_BUILD" =~ ^[0-9]+$ ]] || [[ "$Z_PARALLEL_BUILD" -le 0 ]]; then
+            print_error "${PARALLEL_BUILD_OPT_NAME} must be a positive integer greater than zero"
+            return 1
+        fi
+        print_info "Using $Z_PARALLEL_BUILD parallel jobs"
+        parallel_build_option="${Z_PARALLEL_BUILD}"
+    else
+        print_info "Using all available CPU cores ($(nproc))"
+        parallel_build_option="$(nproc)"
+    fi
+
+    _enter_build_directory "$Z_PROJECT_BUILD_DIR" || {
+        print_error "Failed to enter build directory"
+        return 1
+    }
+
+    local old_path="$PATH"
+
+    # If sysroot location is set add it to PATH. Otherwise, add install location.
+    local sysroot_location="${Z_SYSROOT_LOCATION:-${Z_INSTALL_LOCATION}}"
+    export PATH="${sysroot_location}/bin:${PATH}"
+
+    build_steps "${parallel_build_option}" || {
+        export PATH="${old_path}"
+        return 1
+    }
+
+    export PATH="${old_path}"
+
+    _leave_build_directory "$Z_PROJECT_BUILD_DIR" || {
+        print_error "Failed to leave build directory"
+        return 1
+    }
+
+    return 0
+}
+
+#
+# Description
+#
+#   Configures the project.
+#
+# Global Variables
+#
+#   - Z_PROJECT_NAME: Name of the project (for logging purposes).
+#   - Z_TARGET: Build target (for logging purposes).
+#   - Z_SYSROOT_LOCATION: Location of the sysroot (for logging purposes).
+#   - Z_PROJECT_BUILD_DIR: Directory where the project will be built.
+#
+# Return Value
+#
+#   - On success, returns zero.
+#   - On failure, returns non-zero.
+#
+# Usage Example
+#
+#   configure && echo "Success" || echo "Failure"
+#
+_configure_project() {
+    print_info "Configuring ${Z_PROJECT_NAME} for ${Z_TARGET}..."
+    print_info "Sysroot location: ${Z_SYSROOT_LOCATION}"
+
+    # Save configuration parameters
+    _save_project_config || {
+        print_error "Failed to save build configuration"
+        return 1
+    }
+
+    _check_project_tools || {
+        print_error "Required tools are missing or do not meet the minimum version"
+        return 1
+    }
+
+    download_steps || {
+        print_error "Failed to download dependencies"
+        return 1
+    }
+
+    _create_build_directory "$Z_PROJECT_BUILD_DIR" || {
+        print_error "Failed to create build directory"
+        return 1
+    }
+
+    _enter_build_directory "$Z_PROJECT_BUILD_DIR" || {
+        print_error "Failed to enter build directory"
+        return 1
+    }
+
+    local old_path="$PATH"
+
+    # If sysroot location is set add it to PATH. Otherwise, add install location.
+    local sysroot_location="${Z_SYSROOT_LOCATION:-${Z_INSTALL_LOCATION}}"
+    export PATH="${sysroot_location}/bin:${PATH}"
+
+    configure_steps || {
+        print_error "Configuration failed"
+        export PATH="${old_path}"
+        return 1
+    }
+
+    export PATH="${old_path}"
+
+    _leave_build_directory "$Z_PROJECT_BUILD_DIR" || {
+        print_error "Failed to leave build directory"
+        return 1
+    }
+
+    return 0
+}
+
+#
+# Description
+#
+#   Creates a release of the project.
+#
+# Global Variables
+#
+#   - RELEASE_NAME: Name of the release (used for naming the tarball).
+#   - INSTALL_LOCATION: Directory where the project is installed (to be archived).
+#
+# Return Value
+#
+#  - On success, returns zero.
+#  - On failure, returns non-zero.
+#
+# Usage Example
+#
+#  _release_project && echo "Success" || echo "Failure"
+#
+_release_project() {
+    _configure_project|| {
+        print_error "Configuration failed"
+        return 1
+    }
+    _build_project || {
+        print_error "Build failed"
+        return 1
+    }
+    _install_project || {
+        print_error "Installation failed"
+        return 1
+    }
+
+    print_info "Creating release..."
+
+    local release_name="${Z_RELEASE_NAME:-$(_get_default_release_name)}"
+
+    local tar_file_name="${release_name}.tar.bz2"
+
+    mkdir -p "$Z_OUT_DIR" || {
+        print_error "Failed to create output directory: $Z_OUT_DIR"
+        return 1
+    }
+
+    pushd "$Z_INSTALL_LOCATION" || {
+        print_error "Failed to change directory to ${Z_INSTALL_LOCATION}"
+        return 1
+    }
+
+    # Create a bzip2-compressed tarball of the install location
+    tar -cjf "${Z_OUT_DIR}/${tar_file_name}" . || {
+        print_error "Failed to create tar.bz2 file"
+        return 1
+    }
+
+    popd || {
+        print_error "Failed to return to the previous directory after creating the release"
+        return 1
+    }
+
+    print_info "Release created: ${Z_OUT_DIR}/${tar_file_name}"
+
+    # Run project-specific release steps (e.g. building a container image).
+    if declare -F release_steps >/dev/null; then
+        release_steps || {
+            print_error "Project-specific release steps failed"
+            return 1
+        }
+    fi
+
+    return 0
+}
+
+#
+# Description
+#
+#   Updates the pinned dependency versions in this z script.
+#
+# Global Variables
+#
+#   - Z_PROJECT_NAME: Name of the project (for logging purposes).
+#
+# Return Value
+#
+#  - On success, returns zero.
+#  - On failure, returns non-zero.
+#
+# Usage Example
+#
+#  _update_project && echo "Success" || echo "Failure"
+#
+_update_project() {
+    print_info "Checking for ${Z_PROJECT_NAME} dependency updates..."
+
+    update_steps || {
+        print_error "Failed to update dependencies"
+        return 1
+    }
+
+    return 0
+}
+
+#
+# Description
+#
+#   Displays a help message.
+#
+# Usage Example
+#
+#   _project_help
+#
+_project_help() {
+    local default_release_name
+    default_release_name=$(_get_default_release_name)
+
+    cat << EOF
+Utility for building and installing ${Z_PROJECT_NAME} for Nanvix.
+
+Usage: ./z COMMAND   [OPTIONS]
+       ./z ${BUILD_CMD_NAME}
+       ./z ${CONFIGURE_CMD_NAME} [${PARALLEL_BUILD_OPT_NAME}=N] [${INSTALL_LOCATION_OPT_NAME}=PATH] [${SYSROOT_LOCATION_OPT_NAME}=PATH] [${STAGE_OPT_NAME}=N]
+       ./z ${HELP_CMD_NAME}
+       ./z ${INSTALL_CMD_NAME}
+       ./z ${RELEASE_CMD_NAME}
+       ./z ${SETUP_CMD_NAME}
+       ./z ${SHOW_CONFIG_CMD_NAME}
+       ./z ${UPDATE_CMD_NAME}
+
+Commands:
+  ${BUILD_CMD_NAME}        Build ${Z_PROJECT_NAME} for Nanvix
+  ${CONFIGURE_CMD_NAME}    Configure ${Z_PROJECT_NAME} for Nanvix
+  ${HELP_CMD_NAME}         Print help
+  ${INSTALL_CMD_NAME}      Install ${Z_PROJECT_NAME} for Nanvix
+  ${RELEASE_CMD_NAME}      Create a release of ${Z_PROJECT_NAME} for Nanvix
+  ${SETUP_CMD_NAME}        Install required packages to build ${Z_PROJECT_NAME} for Nanvix
+  ${SHOW_CONFIG_CMD_NAME}  Show current configuration
+  ${UPDATE_CMD_NAME}       Update pinned dependency versions in this z script
+
+Options:
+  ${INSTALL_LOCATION_OPT_NAME}=PATH  Set install location to 'PATH'          (defaults to '${DEFAULT_INSTALL_LOCATION}')
+  ${PARALLEL_BUILD_OPT_NAME}=N       Use 'N' parallel threads when building  (defaults to using all available CPU cores)
+  ${RELEASE_NAME_OPT_NAME}=NAME      Set the release name to 'NAME'          (defaults to '${default_release_name}')
+  ${STAGE_OPT_NAME}=N                Set build stage to 'N'                  (defaults to '${DEFAULT_STAGE}')
+  ${SYSROOT_LOCATION_OPT_NAME}=PATH  Set sysroot location to 'PATH'          (defaults to '${DEFAULT_SYSROOT_LOCATION}')
+EOF
+}
+
+#
+# Description
+#
+#   Parses command line arguments.
+#
+# Parameters
+#
+#   - $@: Command line arguments passed to the script or to a subcommand.
+#
+# Return Value
+#
+#   - On success, this function returns zero.
+#   - On failure, this function returns non-zero.
+#
+# Usage Example
+#
+#   parse_args "$@"
+#
+_parse_project_args() {
+    while [[ $# -gt 0 ]] ; do
+        case "$1" in
+            "${INSTALL_LOCATION_OPT_NAME}="*)
+                Z_INSTALL_LOCATION="${1#*=}"
+                shift
+                ;;
+            "${PARALLEL_BUILD_OPT_NAME}="*)
+                Z_PARALLEL_BUILD="${1#*=}"
+                shift
+                ;;
+            "${RELEASE_NAME_OPT_NAME}="*)
+                Z_RELEASE_NAME="${1#*=}"
+                shift
+                ;;
+            "${STAGE_OPT_NAME}="*)
+                # shellcheck disable=SC2034
+                Z_STAGE="${1#*=}"
+                shift
+                ;;
+            "${SYSROOT_LOCATION_OPT_NAME}="*)
+                Z_SYSROOT_LOCATION="${1#*=}"
+                shift
+                ;;
+            *)
+                print_error "Unknown option '$1'"
+                return 1
+                ;;
+        esac
+    done
+}
+
+
+#
+# Description
+#
+#   Saves the current configuration parameters to a temporary file.
+#
+# Return Value
+#
+#   - On success, this function returns zero.
+#   - On failure, this function returns non-zero.
+#
+# Usage Example
+#
+#   save_config && echo "Success" || echo "Failure"
+#
+_save_project_config() {
+    local release_name="${Z_RELEASE_NAME:-$(_get_default_release_name)}"
+    mkdir -p "$Z_OUT_DIR" || {
+        print_error "Failed to create output directory: $Z_OUT_DIR"
+        return 1
+    }
+    cat > "$Z_CONFIG_FILE" << EOF
+Z_TARGET="$Z_TARGET"
+Z_INSTALL_LOCATION="$Z_INSTALL_LOCATION"
+Z_SYSROOT_LOCATION="$Z_SYSROOT_LOCATION"
+Z_PARALLEL_BUILD="$Z_PARALLEL_BUILD"
+Z_RELEASE_NAME="${release_name}"
+Z_STAGE="$Z_STAGE"
+EOF
+
+    print_info "Configuration parameters saved to $Z_CONFIG_FILE"
+
+    return 0
+}
+
+#
+# Description
+#
+#   Loads configuration parameters from the temporary file.
+#
+# Return Value
+#
+#   - Returns zero if configuration parameters were loaded successfully.
+#   - Returns non zero if the configuration file does not exist or could not be sourced.
+#
+# Usage Example
+#
+#   load_config && echo "Success" || echo "Failure"
+#
+_load_project_config() {
+    if [[ -f "$Z_CONFIG_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$Z_CONFIG_FILE" || {
+            print_error "Failed to source configuration file: $Z_CONFIG_FILE"
+            return 1
+        }
+    else
+        print_error "Configuration file not found: $Z_CONFIG_FILE"
+        return 1
+    fi
+
+    return 0
+}
+
+#
+# Description
+#
+#   Shows current project configuration.
+#
+# Return Value
+#
+#   - Returns zero if configuration parameters were loaded and displayed successfully.
+#   - Returns non zero if the configuration file does not exist or could not be sourced.
+#
+# Usage Example
+#
+#   _show_project_config
+#
+_show_project_config() {
+    if _load_project_config; then
+        print_info "Current configuration:"
+        print_info "  Target: $Z_TARGET"
+        print_info "  Install location: $Z_INSTALL_LOCATION"
+        print_info "  Sysroot location: $Z_SYSROOT_LOCATION"
+        [[ -n "$Z_PARALLEL_BUILD" ]] && print_info "  Parallel build: $Z_PARALLEL_BUILD"
+        print_info "  Release name: ${Z_RELEASE_NAME:-$(_get_default_release_name)}"
+        print_info "  Stage: $Z_STAGE"
+        return 0
+    else
+        return 1
+    fi
+}
+
+#
+# Description
+#
+#   Checks if required tools are available.
+#
+# Return Value
+#
+#   - Returns zero if all required tools are available and meet the minimum version.
+#   - Returns non zero if any tool is missing or does not meet the minimum version.
+#
+# Usage Example
+#
+#   declare -A required_tools=( ["gcc"]="13.3.0" ["make"]="4.3.0" )
+#   _check_project_tools required_tools
+#
+_check_project_tools() {
+    print_info "Checking for required development tools..."
+
+    for tool in "${!Z_PROJECT_REQUIRED_TOOLS[@]}"; do
+        print_info "Checking if $tool exists..."
+
+        local min_version="${Z_PROJECT_REQUIRED_TOOLS[$tool]}"
+
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            print_error "$tool is not installed or not in PATH"
+            return 1
+        fi
+
+        # Get version string.
+        local version
+        version=$(get_tool_version "$tool")
+        if [[ -z "$version" ]]; then
+            print_error "Unable to determine $tool version"
+            return 1
+        fi
+
+        # Normalize versions to three parts for consistent comparison.
+        version=$(normalize_version "$version")
+        min_version=$(normalize_version "$min_version")
+
+        # Check if tool version is older than the minimum required version.
+        if ! compare_version "$version" "$min_version"; then
+            print_error "$tool version $version is too old (required >= $min_version)"
+            return 1
+        fi
+
+        print_info "$tool $version found"
+    done
+
+    print_info "All required tools are available."
+
+    return 0
+}
+
+#
+# Description
+#
+#   Validates if the current OS is supported.
+#
+# Return Value
+#
+#   - On success, returns zero.
+#   - On failure, returns non-zero.
+#
+# Usage Example
+#
+#   _check_os_compatibility && echo "Success" || echo "Failure"
+#
+_check_project_os_support() {
+    local osid
+    osid=$(get_os_id) || {
+        print_error "Failed to get OS ID"
+        return 1
+    }
+    if [[ "${osid}" != "${SUPPORTED_OS_ID}" ]]; then
+        print_error "Unsupported OS '${osid}'"
+        print_info "This script supports only Ubuntu."
+        return 1
+    fi
+
+    local osver
+    osver=$(get_os_version_id) || {
+        print_error "Failed to get OS version"
+        return 1
+    }
+    if [[ "${osver}"  != "${SUPPORTED_OS_VERSION}" ]]; then
+        print_error "Unsupported Ubuntu version '${osver}'"
+        print_info "This script supports only Ubuntu 24.04."
+        return 1
+    fi
+
+    return 0
+}
+
+# Main function
+zmain() {
+    # Validate OS compatibility first
+    _check_project_os_support || {
+        print_error "Unsupported OS. This script supports only Ubuntu ${SUPPORTED_OS_VERSION}."
+        return 1
+    }
+
+    # Check if no command was specified.
+    if [[ $# -eq 0 ]]; then
+        _project_help
+        return 1
+    fi
+
+    local command="$1"
+    shift
+
+    # Handle commands
+    case "$command" in
+        "$HELP_CMD_NAME")
+            _project_help
+            return 0
+            ;;
+        "$BUILD_CMD_NAME" | \
+        "$CONFIGURE_CMD_NAME" | \
+        "$INSTALL_CMD_NAME" | \
+        "$RELEASE_CMD_NAME" | \
+        "$SETUP_CMD_NAME" | \
+        "$SHOW_CONFIG_CMD_NAME" | \
+        "$UPDATE_CMD_NAME")
+            # Valid commands - will be handled below
+            ;;
+        *)
+            _project_help
+            print_error "Unknown command: $command"
+            return 1
+            ;;
+    esac
+
+    # Handle setup command.
+    if [[ "$command" == "$SETUP_CMD_NAME" ]]; then
+        _setup_project || {
+            print_error "Setup failed"
+            return 1
+        }
+        print_success "Setup completed successfully."
+        return 0
+    fi
+
+    # For all other commands, check if required tools are available.
+    _check_project_tools || {
+        print_error "Required tools are missing or do not meet the minimum version"
+        return 1
+    }
+
+    # Handle update command. This only rewrites pinned versions in this script
+    # and does not require a saved build configuration.
+    if [[ "$command" == "$UPDATE_CMD_NAME" ]]; then
+        _update_project || {
+            print_error "Update failed"
+            return 1
+        }
+        print_success "Update completed successfully."
+        return 0
+    fi
+
+    # Handle configure command.
+    if [[ "$command" == "$CONFIGURE_CMD_NAME" ]]; then
+        _parse_project_args "$@" || {
+            print_error "Failed to parse arguments"
+            return 1
+        }
+
+        _configure_project || {
+            print_error "Configuration failed"
+            return 1
+        }
+        print_success "Configuration completed successfully."
+        return 0
+    fi
+
+    # For other commands, load saved configuration.
+    _load_project_config || {
+        print_error "Failed to load build configuration."
+        return 1
+    }
+
+    # Handle all other commands.
+    case "$command" in
+        "${BUILD_CMD_NAME}")
+            _build_project || {
+                print_error "Build failed"
+                return 1
+            }
+            print_success "Build completed successfully."
+            ;;
+        "${INSTALL_CMD_NAME}")
+            _install_project || {
+                print_error "Installation failed"
+                return 1
+            }
+            print_success "Installation completed successfully."
+            ;;
+        "${RELEASE_CMD_NAME}")
+            _release_project || {
+                print_error "Release creation failed"
+                return 1
+            }
+            print_success "Release created successfully."
+            ;;
+        "${SHOW_CONFIG_CMD_NAME}")
+            _show_project_config || {
+                print_error "Could not show configuration."
+                return 1
+            }
+            ;;
+        *)
+            # If still unknown, show help.
+            _project_help
+            print_error "Unknown command: $command"
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+#==================================================================================================
+# Z Constants
+#==================================================================================================
+
+# Directory containing this script (resolves symlinks to the real path).
+script_source="${BASH_SOURCE[0]}"
+while [[ -h "${script_source}" ]]; do
+    script_dir="$(cd -P "$(dirname "${script_source}")" >/dev/null 2>&1 && pwd)"
+    script_source="$(readlink "${script_source}")"
+    [[ "${script_source}" != /* ]] && script_source="${script_dir}/${script_source}"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "${script_source}")" >/dev/null 2>&1 && pwd)"
+
+# Absolute path to this z script. The update command rewrites the pinned
+# dependency versions in this file.
+readonly Z_FILE_PATH="${script_source}"
+
+# Project Name
+readonly Z_PROJECT_NAME="LLVM"
+# Directory used when building, empty if not required.
+readonly Z_PROJECT_BUILD_DIR=""
+
+# Required Build Tools (tool_name => minimum_version)
+readonly -A Z_PROJECT_REQUIRED_TOOLS=(
+    ["gcc"]="13.3.0"
+    ["make"]="4.3.0"
+    ["ninja"]="1.11.1"
+    ["wget"]="1.21.4"
+    ["bzip2"]="1.0.8"
+    ["tar"]="1.34.0"
+    ["cmake"]="3.28.3"
+    ["gh"]="2.0.0"
+    ["git"]="2.43.0"
+    ["curl"]="8.5.0"
+    ["jq"]="1.7.0"
+)
+
+# Required System Packages for Setup
+readonly Z_PROJECT_REQUIRED_PACKAGES=("build-essential" "ninja-build" "wget" "bzip2" "tar" "cmake" "gh" "git" "curl" "jq")
+
+#==================================================================================================
+# Project-Specific Constants
+#==================================================================================================
+
+# Build Targets
+BUILD_TARGETS=("all")
+
+# Install Targets
+INSTALL_TARGETS=("install")
+
+# Target triple for the Nanvix toolchain. Kept in a single place so the stage 0
+# default triple, the stage 1 cross-compile target, and the compiler-rt install
+# directory stay in sync with the clang driver's getTriple().str().
+readonly NANVIX_TARGET="i686-unknown-nanvix"
+
+# Nanvix source tree providing the in-source libc, headers, and user linker
+# script. Set via Z_NANVIX_SRC.
+readonly NANVIX_SRC="${Z_NANVIX_SRC:-}"
+# In-source libc artifacts copied into the sysroot lib directory.
+readonly NANVIX_LIBS=(crt0.o libc.a libm.a libc.so libm.so libnvx_crt0.a libdl.a libpthread.a librt.a)
+# Nanvix release used in CI when no source tree is present: a tarball whose
+# root holds include/ + lib/ (libc.a/libm.a/libc.so/libm.so/crt0.o/user.ld...).
+readonly NANVIX_RELEASE_TAG="${Z_NANVIX_RELEASE_TAG:-v0.19.9}"
+readonly NANVIX_RELEASE_PATTERN="nanvix-x86-microvm-standalone-release-*.tar.bz2"
+
+#==================================================================================================
+# Project-Specific Functions
+#==================================================================================================
+
+#
+# Description
+#
+#   Executes project-specific steps for downloading dependencies.
+#
+# Return Value
+#
+#   - On success, this function returns zero.
+#   - On failure, this function returns non-zero.
+#
+download_steps() {
+    # Stage 0 (compiler only): no sysroot needed.
+    if [[ "${Z_STAGE}" == "0" ]]; then
+        print_info "Stage 0: no dependencies to download."
+        return 0
+    fi
+
+    # Stage 1 (runtimes): stage the in-source Nanvix libc into the sysroot.
+    if [[ "${Z_STAGE}" == "1" ]]; then
+        local sysroot_location="${Z_SYSROOT_LOCATION:-${Z_INSTALL_LOCATION}}"
+        local install_location="${Z_INSTALL_LOCATION}"
+        local nanvix_src="${NANVIX_SRC}"
+
+        # No local source tree (e.g. CI): download a Nanvix release tarball whose
+        # root holds include/ + lib/, and use it as the libc source.
+        if [[ ! -f "${nanvix_src}/include/stdlib.h" ]]; then
+            print_info "Nanvix source not found; downloading release ${NANVIX_RELEASE_TAG}..."
+            local rel_dir
+            rel_dir="$(mktemp -d)" || {
+                print_error "Failed to create a temporary directory for the Nanvix release download."
+                return 1
+            }
+            # Remove the temporary release directory when this function returns,
+            # regardless of success or failure. Guard the expansion: when the
+            # shell runs with functrace (set -T), this RETURN trap is inherited
+            # by later functions and fires after rel_dir has gone out of scope,
+            # which would abort under `set -u` ("rel_dir: unbound variable").
+            trap 'rm -rf "${rel_dir:-}" 2>/dev/null || true' RETURN
+            gh release download "${NANVIX_RELEASE_TAG}" --repo nanvix/nanvix \
+                --pattern "${NANVIX_RELEASE_PATTERN}" --dir "${rel_dir}" || {
+                print_error "Failed to download Nanvix release ${NANVIX_RELEASE_TAG}."
+                return 1
+            }
+            local rel_archive
+            rel_archive=$(find "${rel_dir}" -maxdepth 1 -name "${NANVIX_RELEASE_PATTERN}" | head -1)
+            if [[ -z "${rel_archive}" ]]; then
+                print_error "No Nanvix release archive matching '${NANVIX_RELEASE_PATTERN}' was downloaded for tag ${NANVIX_RELEASE_TAG}."
+                return 1
+            fi
+            extract_tar_bz2 "${rel_archive}" "${rel_dir}" || {
+                print_error "Failed to extract Nanvix release."
+                return 1
+            }
+            nanvix_src="${rel_dir}"
+        fi
+
+        if [[ ! -d "${nanvix_src}" ]]; then
+            print_error "Stage 1 requires a Nanvix libc source/release at '${nanvix_src}'."
+            return 1
+        fi
+
+        # C headers.
+        if [[ ! -f "${nanvix_src}/include/stdlib.h" ]]; then
+            print_error "Nanvix headers not found at '${nanvix_src}/include'."
+            return 1
+        fi
+        mkdir -p "${sysroot_location}/usr/include"
+        cp -a "${nanvix_src}/include/." "${sysroot_location}/usr/include/" || {
+            print_error "Failed to stage Nanvix headers."
+            return 1
+        }
+        print_info "Stage 1: Nanvix headers staged from '${nanvix_src}/include'."
+
+        # libc/libm/crt0 + stub archives. The Nanvix driver
+        # resolves crt0.o and the archives under $SYSROOT/lib (see
+        # clang/lib/Driver/ToolChains/Nanvix.cpp), so they must be staged into
+        # the sysroot rather than the install prefix.
+        mkdir -p "${sysroot_location}/lib"
+        for lib in "${NANVIX_LIBS[@]}"; do
+            if [[ ! -f "${nanvix_src}/lib/${lib}" ]]; then
+                print_error "Missing in-source libc artifact '${nanvix_src}/lib/${lib}'."
+                print_error "Build Nanvix first so 'lib/' is populated."
+                return 1
+            fi
+            install -m 644 "${nanvix_src}/lib/${lib}" "${sysroot_location}/lib/"
+        done
+        # user.ld ships in lib/ in a release tarball; fall back to the in-tree
+        # build path for a source checkout.
+        if [[ -f "${nanvix_src}/lib/user.ld" ]]; then
+            install -m 644 "${nanvix_src}/lib/user.ld" "${sysroot_location}/lib/"
+        elif [[ -f "${nanvix_src}/build/user/linker/x86/user.ld" ]]; then
+            install -m 644 "${nanvix_src}/build/user/linker/x86/user.ld" "${sysroot_location}/lib/"
+        else
+            print_error "Failed to locate user.ld in '${nanvix_src}'."
+            return 1
+        fi
+        print_info "Stage 1: in-source libc artifacts staged into '${sysroot_location}/lib'."
+
+        # nanvixd binaries for integration tests (best effort).
+        mkdir -p "${install_location}/libexec/nanvixd"
+        for b in nanvixd.elf kernel.elf linuxd.elf uservm.elf; do
+            [[ -f "${nanvix_src}/bin/${b}" ]] && \
+                install -m 755 "${nanvix_src}/bin/${b}" "${install_location}/libexec/nanvixd/" || true
+        done
+
+        return 0
+    fi
+
+    print_error "No build stage specified. Use --stage=0 or --stage=1."
+    return 1
+}
+
+#
+# Description
+#
+#   Configures an LLVM stage 0 build (Clang + LLD only, no runtimes).
+#
+configure_stage0() {
+    local sysroot_location="${Z_SYSROOT_LOCATION:-${Z_INSTALL_LOCATION}}"
+
+    # Use sccache as compiler launcher if available.
+    local cmake_launcher_options=()
+    if command -v sccache >/dev/null 2>&1; then
+        cmake_launcher_options+=(
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+        )
+    fi
+
+    cmake -S llvm -B build -G Ninja \
+        -DCMAKE_VERBOSE_MAKEFILE=ON \
+        -DLLVM_PARALLEL_LINK_JOBS=1 \
+        -DLLVM_ENABLE_PROJECTS='clang;lld' \
+        -DLLVM_TARGETS_TO_BUILD=X86 \
+        -DLLVM_DEFAULT_TARGET_TRIPLE="${NANVIX_TARGET}" \
+        -DDEFAULT_SYSROOT="${sysroot_location}" \
+        -DC_INCLUDE_DIRS="${sysroot_location}/usr/include" \
+        -DCMAKE_BUILD_TYPE=Release \
+        "${cmake_launcher_options[@]}" || {
+        print_error "Stage 0 configuration failed."
+        return 1
+    }
+
+    return 0
+}
+
+#
+# Description
+#
+#   Configures an LLVM stage 1 build (runtimes only, using installed Clang).
+#
+configure_stage1() {
+    local sysroot_location="${Z_SYSROOT_LOCATION:-${Z_INSTALL_LOCATION}}"
+
+    # Extract LLVM version for compiler-rt install path.
+    local llvm_version_major
+    llvm_version_major=$(sed -n 's/.*LLVM_VERSION_MAJOR \([0-9]*\).*/\1/p' cmake/Modules/LLVMVersion.cmake)
+    if [[ -z "${llvm_version_major}" ]]; then
+        print_error "Failed to parse LLVM_VERSION_MAJOR from cmake/Modules/LLVMVersion.cmake."
+        return 1
+    fi
+
+    # Config options for compiler-rt.
+    local compiler_rt_options=(
+        -DCOMPILER_RT_BUILD_BUILTINS=ON
+        -DCOMPILER_RT_BUILD_CRT=OFF
+        -DCOMPILER_RT_USE_LIBCXX=OFF
+        -DCOMPILER_RT_CXX_LIBRARY=none
+        -DCOMPILER_RT_CAN_EXECUTE_TESTS=OFF
+        -DCOMPILER_RT_BAREMETAL_BUILD=ON
+        -DCOMPILER_RT_BUILD_GWP_ASAN=OFF
+        -DCOMPILER_RT_BUILD_LIBFUZZER=OFF
+        -DCOMPILER_RT_BUILD_MEMPROF=OFF
+        -DCOMPILER_RT_BUILD_PROFILE=OFF
+        -DCOMPILER_RT_BUILD_CTX_PROFILE=OFF
+        -DCOMPILER_RT_BUILD_SANITIZERS=OFF
+        -DCOMPILER_RT_BUILD_XRAY=OFF
+        -DCOMPILER_RT_BUILD_ORC=OFF
+        -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON
+        -DCOMPILER_RT_INSTALL_LIBRARY_DIR="${Z_INSTALL_LOCATION}/lib/clang/${llvm_version_major}/lib/${NANVIX_TARGET}"
+    )
+
+    # Config options for libc++.
+    local libcxx_options=(
+        -DLIBCXX_ENABLE_SHARED=OFF
+        -DLIBCXX_ENABLE_STATIC=ON
+        -DLIBCXX_INCLUDE_TESTS=OFF
+        -DLIBCXX_INCLUDE_BENCHMARKS=OFF
+        -DLIBCXX_ENABLE_TIME_ZONE_DATABASE=OFF
+        -DLIBCXX_HAS_MUSL_LIBC=OFF
+        # Wide characters, localization and <filesystem> are all enabled (no
+        # flags needed; libc++ defaults them ON). The Nanvix libc now declares
+        # and defines everything these features need: the wide-character API
+        # (wcstof/wcstold/wcspbrk/wcscoll/wcsxfrm/wcsrtombs/mbrtowc/the wcsto*
+        # family), the POSIX xlocale API (uselocale/newlocale/freelocale and the
+        # _l variants), the wide stdio functions (getwc/getwchar/fgetwc/ungetwc/
+        # putwc/putwchar/fputwc/...), the C99 international monetary members of
+        # struct lconv (int_p_cs_precedes/int_p_sep_by_space/int_p_sign_posn and
+        # the matching int_n_* trio), catopen/catgets/catclose, and the POSIX
+        # filesystem facilities. A stage 1 runtimes build with all three ON
+        # builds cleanly and links C, C++, <iostream> and <filesystem> programs
+        # (verified 2026-07-02).
+    )
+
+    # Config options for libunwind.
+    local libunwind_options=(
+        -DLIBUNWIND_ENABLE_STATIC=ON
+        -DLIBUNWIND_ENABLE_SHARED=OFF
+        -DLIBUNWIND_USE_COMPILER_RT=ON
+        -DLIBUNWIND_IS_BAREMETAL=ON
+        -DLIBUNWIND_ADDITIONAL_COMPILE_FLAGS='-mno-sse;-mno-sse2'
+    )
+
+    # Config options for libcxxabi.
+    local libcxxabi_options=(
+        -DLIBCXXABI_USE_COMPILER_RT=ON
+        -DLIBCXXABI_ENABLE_STATIC_UNWINDER=ON
+        -DLIBCXXABI_ENABLE_STATIC=ON
+        -DLIBCXXABI_ENABLE_SHARED=OFF
+    )
+
+    # Use sccache as compiler launcher if available.
+    local cmake_launcher_options=()
+    if command -v sccache >/dev/null 2>&1; then
+        cmake_launcher_options+=(
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+        )
+    fi
+
+    cmake -S runtimes -B build-runtimes -G Ninja \
+        -DCMAKE_VERBOSE_MAKEFILE=ON \
+        -DCMAKE_SYSTEM_NAME=Nanvix \
+        -DCMAKE_MODULE_PATH="${SCRIPT_DIR}/cmake/nanvix" \
+        -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+        -DCMAKE_C_COMPILER="${Z_INSTALL_LOCATION}/bin/clang" \
+        -DCMAKE_CXX_COMPILER="${Z_INSTALL_LOCATION}/bin/clang++" \
+        -DCMAKE_C_COMPILER_TARGET="${NANVIX_TARGET}" \
+        -DCMAKE_CXX_COMPILER_TARGET="${NANVIX_TARGET}" \
+        -DCMAKE_SYSROOT="${sysroot_location}" \
+        -DLLVM_ENABLE_RUNTIMES='compiler-rt;libunwind;libcxx;libcxxabi' \
+        -DCMAKE_BUILD_TYPE=Release \
+        "${cmake_launcher_options[@]}" \
+        "${compiler_rt_options[@]}" \
+        "${libcxx_options[@]}" \
+        "${libunwind_options[@]}" \
+        "${libcxxabi_options[@]}" || {
+        print_error "Stage 1 configuration failed."
+        return 1
+    }
+
+    return 0
+}
+
+#
+# Description
+#
+#   Executes project-specific steps for configuring a build.
+#
+# Return Value
+#
+#   - On success, this function returns zero.
+#   - On failure, this function returns non-zero.
+#
+# Usage Example
+#
+#   configure_steps "i686-nanvix" "/usr/local"
+#
+configure_steps() {
+    if [[ "${Z_STAGE}" == "0" ]]; then
+        configure_stage0
+    elif [[ "${Z_STAGE}" == "1" ]]; then
+        configure_stage1
+    else
+        print_error "No build stage specified. Use --stage=0 or --stage=1."
+        return 1
+    fi
+}
+
+#
+# Description
+#
+#   Project-specific steps for building the project.
+#
+# Parameters
+#
+#   - $1: Number of parallel build jobs.
+#
+# Usage Example
+#
+#   build_steps 4 "all" "check"
+#
+build_steps() {
+    local parallel_build_option=$1
+
+    local build_dir="build"
+    if [[ "${Z_STAGE}" == "1" ]]; then
+        build_dir="build-runtimes"
+    fi
+
+    cmake --build "${build_dir}" -j "${parallel_build_option}" -v || {
+        print_error "Build failed for targets: '${BUILD_TARGETS[*]}'."
+        return 1
+    }
+
+    return 0
+}
+
+#
+# Description
+#
+#   Project-specific steps for installing the project.
+#
+# Return Value
+#
+#   - On success, this function returns zero.
+#   - On failure, this function returns non-zero.
+#
+# Usage Example
+#
+#   install_steps "install" "/usr/local"
+#
+install_steps() {
+    local build_dir="build"
+    if [[ "${Z_STAGE}" == "1" ]]; then
+        build_dir="build-runtimes"
+    fi
+
+    cmake -DCMAKE_INSTALL_PREFIX="${Z_INSTALL_LOCATION}" -P "${build_dir}/cmake_install.cmake" || {
+        print_error "Installation failed."
+        return 1
+    }
+
+    return 0
+}
+
+#==================================================================================================
+# Update Support
+#
+# The functions below fetch the latest release information for a Nanvix
+# dependency and rewrite the related readonly variables in this z script when
+# they are out of date. Two strategies are supported:
+#
+#   * asset mode (default): selects a release asset by name, parses a version
+#     and short commit hash from the asset file name, and updates the
+#     <PREFIX>_VERSION, <PREFIX>_SHORT_COMMIT_HASH and <PREFIX>_SHA256_CHECKSUM
+#     variables.
+#
+#   * tag mode (--tag): reads the release tag name (.tag_name) and updates the
+#     <PREFIX>_RELEASE_TAG variable, preserving an optional
+#     "${Z_<PREFIX>_RELEASE_TAG:-<default>}" environment override.
+#==================================================================================================
+
+# Names of the variables modified by the last update operation.
+Z_UPDATED_VARS=()
+# Whether the last update operation changed this z script.
+Z_UPDATE_CHANGED=false
+# Release tag resolved by the last tag-mode update operation.
+Z_UPDATE_TAG=""
+
+#
+# Description
+#
+#   Updates a plain `readonly VAR="value"` definition in this z script,
+#   appending it if absent.
+#
+# Parameters
+#
+#   - $1: Variable name.
+#   - $2: New value.
+#
+update_var() {
+    local var=$1 val=$2 esc_val line current_val
+    esc_val=$(printf '%s' "$val" | sed 's/[\/&]/\\&/g')
+
+    # Find first matching definition (if any).
+    line=$(grep -m1 -E "^(readonly[[:space:]]+)?${var}=" "$Z_FILE_PATH" || true)
+
+    if [[ -n "$line" ]]; then
+        # Extract RHS, strip comments/whitespace and optional surrounding quotes.
+        current_val=$(printf '%s' "$line" | sed -E "s/^[^=]+=//; s/[[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//; s/^\"(.*)\"$/\1/; s/^'(.*)'$/\1/")
+    else
+        current_val=""
+    fi
+
+    if [[ "$current_val" == "$val" ]]; then
+        print_info "No change for ${var} (already ${val})"
+        return 0
+    fi
+
+    if [[ -n "$line" ]]; then
+        sed -E -i "s|^(readonly[[:space:]]+)?${var}=.*$|readonly ${var}=\"${esc_val}\"|" "$Z_FILE_PATH"
+    else
+        echo "readonly ${var}=\"${val}\"" >> "$Z_FILE_PATH"
+    fi
+
+    Z_UPDATED_VARS+=("$var")
+    Z_UPDATE_CHANGED=true
+    print_info "Updated ${var} -> ${val}"
+}
+
+#
+# Description
+#
+#   Updates a `readonly VAR="${ENV:-default}"` definition in this z script,
+#   preserving the environment-override form when present and falling back to a
+#   plain assignment otherwise.
+#
+# Parameters
+#
+#   - $1: Variable name.
+#   - $2: Environment override variable name.
+#   - $3: New default value.
+#
+update_tag_var() {
+    local var=$1 envvar=$2 val=$3 esc_val line current_val
+    esc_val=$(printf '%s' "$val" | sed 's/[\/&|]/\\&/g')
+
+    line=$(grep -m1 -E "^(readonly[[:space:]]+)?${var}=" "$Z_FILE_PATH" || true)
+
+    if [[ -z "$line" ]]; then
+        echo "readonly ${var}=\"\${${envvar}:-${val}}\"" >> "$Z_FILE_PATH"
+        Z_UPDATED_VARS+=("$var")
+        Z_UPDATE_CHANGED=true
+        print_info "Added ${var} -> ${val}"
+        return 0
+    fi
+
+    if [[ "$line" == *"\${${envvar}:-"* ]]; then
+        # Preserve the "${ENV:-default}" override; replace only the default.
+        current_val=$(printf '%s' "$line" | sed -E "s/.*\\\$\\{${envvar}:-([^}]*)\\}.*/\1/")
+        if [[ "$current_val" == "$val" ]]; then
+            print_info "No change for ${var} (already ${val})"
+            return 0
+        fi
+        sed -E -i "s|(\\\$\\{${envvar}:-)[^}]*(\\})|\1${esc_val}\2|" "$Z_FILE_PATH"
+    else
+        current_val=$(printf '%s' "$line" | sed -E "s/^[^=]+=//; s/[[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//; s/^\"(.*)\"$/\1/; s/^'(.*)'$/\1/")
+        if [[ "$current_val" == "$val" ]]; then
+            print_info "No change for ${var} (already ${val})"
+            return 0
+        fi
+        sed -E -i "s|^(readonly[[:space:]]+)?${var}=.*$|readonly ${var}=\"${esc_val}\"|" "$Z_FILE_PATH"
+    fi
+
+    Z_UPDATED_VARS+=("$var")
+    Z_UPDATE_CHANGED=true
+    print_info "Updated ${var} -> ${val}"
+}
+
+#
+# Description
+#
+#   Performs an HTTP GET against a GitHub API URL, retrying transient failures
+#   with exponential backoff: network errors, HTTP 5xx, and — when
+#   authenticated — 403/429 secondary rate limiting. Permanent client errors
+#   (other 4xx) fail fast, as does an unauthenticated 403/429 primary rate
+#   limit, which will not clear within the retry window. When a token is present
+#   in the environment (GH_TOKEN or GITHUB_TOKEN), the request is authenticated
+#   so it uses GitHub's higher authenticated API rate limit instead of the
+#   shared unauthenticated one.
+#
+# Parameters
+#
+#   - $1: URL to fetch.
+#
+# Return Value
+#
+#   - On success, prints the response body to stdout and returns zero.
+#   - On failure (permanent error or all retries exhausted), returns non-zero.
+#
+github_api_get() {
+    local url=$1
+    local max_attempts=5 attempt=1 delay=3
+    local token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+    local -a headers=(-H "Accept: application/vnd.github+json")
+    if [[ -n "$token" ]]; then
+        headers+=(-H "Authorization: Bearer ${token}")
+    fi
+
+    while (( attempt <= max_attempts )); do
+        local body_file http_code
+        body_file=$(mktemp)
+        http_code=$(curl -sL \
+            --connect-timeout 15 --max-time 60 \
+            "${headers[@]}" \
+            -o "$body_file" -w '%{http_code}' \
+            "$url" 2>/dev/null || echo "000")
+
+        if [[ "$http_code" == "200" && -s "$body_file" ]]; then
+            cat "$body_file"
+            rm -f "$body_file"
+            return 0
+        fi
+
+        rm -f "$body_file"
+
+        # Classify the failure. Network errors (000) and server errors (5xx)
+        # are transient and worth retrying. Secondary rate limiting (403/429)
+        # is only retried when authenticated, since an unauthenticated primary
+        # rate limit will not clear within the retry window. All other 4xx are
+        # permanent client errors and fail fast.
+        local retryable=false
+        if [[ "$http_code" == "000" || "$http_code" =~ ^5[0-9][0-9]$ ]]; then
+            retryable=true
+        elif [[ ( "$http_code" == "403" || "$http_code" == "429" ) && -n "$token" ]]; then
+            retryable=true
+        fi
+
+        # Surface an actionable hint when the failure looks like API rate
+        # limiting and no token was used.
+        local hint=""
+        if [[ -z "$token" && ( "$http_code" == "403" || "$http_code" == "429" ) ]]; then
+            hint=" (likely API rate limiting; set GH_TOKEN or GITHUB_TOKEN to use the higher authenticated limit)"
+        fi
+
+        if [[ "$retryable" == "false" ]]; then
+            print_warning "GitHub API request failed (HTTP ${http_code}, not retryable)${hint}: ${url}"
+            return 1
+        fi
+
+        print_warning "GitHub API request failed (attempt ${attempt}/${max_attempts}, HTTP ${http_code})${hint}: ${url}"
+        if (( attempt < max_attempts )); then
+            sleep "$delay"
+            (( delay *= 2 ))
+        fi
+        (( attempt++ ))
+    done
+
+    return 1
+}
+
+#
+# Description
+#
+#   Fetches the latest release metadata from a GitHub API URL and updates the
+#   related variables in this z script when they are out of date.
+#
+# Parameters
+#
+#   tag mode:   update_release --tag <api_url> <var_prefix>
+#   asset mode: update_release <api_url> <asset_regex> <parse_regex> <var_prefix>
+#
+# Return Value
+#
+#   - On success, returns zero (even when no update was required).
+#   - On failure, returns non-zero.
+#
+update_release() {
+    local mode=asset
+    if [[ "${1:-}" == "--tag" ]]; then
+        mode=tag
+        shift
+    fi
+
+    local api asset_regex parse_regex var_prefix
+    if [[ "$mode" == "asset" ]]; then
+        if [[ "$#" -ne 4 ]]; then
+            print_error "update_release (asset mode) requires <api_url> <asset_regex> <parse_regex> <var_prefix>"
+            return 1
+        fi
+        api=$1
+        asset_regex=$2
+        parse_regex=$3
+        var_prefix=$4
+    else
+        if [[ "$#" -ne 2 ]]; then
+            print_error "update_release (tag mode) requires <api_url> <var_prefix>"
+            return 1
+        fi
+        api=$1
+        var_prefix=$2
+        asset_regex=""
+        parse_regex=""
+    fi
+
+    # Validate prefix as a shell variable name.
+    if ! [[ $var_prefix =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        print_error "Variable prefix '${var_prefix}' is not a valid shell identifier"
+        return 1
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        print_error "jq is not installed and is required by the update command"
+        return 1
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        print_error "curl is not installed and is required by the update command"
+        return 1
+    fi
+
+    local version_var="${var_prefix}_VERSION"
+    local short_hash_var="${var_prefix}_SHORT_COMMIT_HASH"
+    local checksum_var="${var_prefix}_SHA256_CHECKSUM"
+    local tag_var="${var_prefix}_RELEASE_TAG"
+    local tag_env_var="Z_${var_prefix}_RELEASE_TAG"
+
+    print_info "Fetching release metadata: ${api}"
+    local resp
+    resp=$(github_api_get "$api") || {
+        print_error "Failed to fetch release metadata from ${api} after multiple attempts"
+        return 1
+    }
+
+    # ----------------------------------------------------------------------
+    # Tag mode: pin <PREFIX>_RELEASE_TAG to the release's tag_name.
+    # ----------------------------------------------------------------------
+    if [[ "$mode" == "tag" ]]; then
+        local tag
+        tag=$(echo "$resp" | jq -r '.tag_name // empty')
+        if [[ -z "$tag" ]]; then
+            print_error "Release metadata has no tag_name"
+            return 1
+        fi
+        print_info "Latest release tag: ${tag}"
+        Z_UPDATE_TAG="$tag"
+        update_tag_var "$tag_var" "$tag_env_var" "$tag"
+        return 0
+    fi
+
+    # ----------------------------------------------------------------------
+    # Asset mode: select an asset and update version/hash/checksum variables.
+    # ----------------------------------------------------------------------
+    local asset
+    asset=$(echo "$resp" | jq -r --arg rx "$asset_regex" '.assets[] | select(.name | test($rx))' || true)
+    if [[ -z "$asset" ]]; then
+        print_info "No matching asset found (regex: ${asset_regex})"
+        return 0
+    fi
+
+    local asset_name asset_digest version short_hash
+    asset_name=$(echo "$asset" | jq -r '.name')
+    asset_digest=$(echo "$asset" | jq -r '.digest // empty')
+
+    if [[ "$asset_name" =~ $parse_regex ]]; then
+        version=${BASH_REMATCH[1]}
+        short_hash=${BASH_REMATCH[2]}
+    else
+        print_error "Failed to parse version/hash from asset name using regex: ${parse_regex}"
+        return 1
+    fi
+
+    print_info "Latest release parsed: version=${version} short_hash=${short_hash}"
+
+    update_var "$short_hash_var" "$short_hash"
+    update_var "$checksum_var" "$asset_digest"
+    update_var "$version_var" "$version"
+
+    return 0
+}
+
+#
+# Description
+#
+#   Executes project-specific steps for updating pinned dependency versions.
+#
+# Return Value
+#
+#   - On success, this function returns zero.
+#   - On failure, this function returns non-zero.
+#
+update_steps() {
+    # Reset update tracking state.
+    Z_UPDATED_VARS=()
+    Z_UPDATE_CHANGED=false
+    Z_UPDATE_TAG=""
+
+    # Nanvix release: pin NANVIX_RELEASE_TAG to the latest nanvix/nanvix tag.
+    update_release --tag \
+        "https://api.github.com/repos/nanvix/nanvix/releases/latest" \
+        "NANVIX" || {
+        print_error "Failed to update NANVIX_RELEASE_TAG."
+        return 1
+    }
+
+    if [[ "${Z_UPDATE_CHANGED}" == "true" ]]; then
+        print_info "Updated variables: ${Z_UPDATED_VARS[*]}"
+    else
+        print_info "All dependencies are already up to date."
+    fi
+
+    # When running under GitHub Actions, expose the result so the workflow can
+    # decide whether to open a pull request without re-deriving it.
+    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+        {
+            echo "changed=${Z_UPDATE_CHANGED}"
+            echo "tag=${Z_UPDATE_TAG}"
+            echo "updated_vars=$(IFS=,; echo "${Z_UPDATED_VARS[*]:-}")"
+        } >> "${GITHUB_OUTPUT}"
+    fi
+
+    return 0
+}
+
+#==================================================================================================
+# Test Support
+#
+# Build-only smoke tests for the produced toolchain. These do not run any
+# program; they verify that the expected runtime artifacts are installed and
+# that minimal C and C++ programs compile and link for the Nanvix target.
+#==================================================================================================
+
+#
+# Description
+#
+#   Verifies that the expected stage 1 runtime artifacts are present in the
+#   install location.
+#
+# Return Value
+#
+#   - On success, returns zero.
+#   - On failure, returns non-zero.
+#
+# Usage Example
+#
+#   ./z verify
+#
+verify_artifacts() {
+    local install_location="${Z_INSTALL_LOCATION:-${DEFAULT_INSTALL_LOCATION}}"
+
+    print_info "Verifying toolchain artifacts in '${install_location}'..."
+    local failed=0
+
+    # C++ runtime libraries.
+    for lib in libc++.a libc++abi.a libunwind.a; do
+        if [[ ! -f "${install_location}/lib/${lib}" ]]; then
+            print_error "Missing runtime library '${install_location}/lib/${lib}'."
+            failed=1
+        fi
+    done
+
+    # compiler-rt builtins (per-target directory).
+    local builtins
+    builtins=$(find "${install_location}/lib/clang" \
+        -path "*/${NANVIX_TARGET}/libclang_rt.builtins*.a" 2>/dev/null | head -1)
+    if [[ -z "${builtins}" ]]; then
+        print_error "compiler-rt builtins library for ${NANVIX_TARGET} not found."
+        failed=1
+    fi
+
+    if [[ "${failed}" -ne 0 ]]; then
+        print_error "Artifact verification failed."
+        return 1
+    fi
+
+    print_success "All expected toolchain artifacts are present."
+    return 0
+}
+
+#
+# Description
+#
+#   Compiles and links one smoke-test source for the Nanvix target without
+#   running it.
+#
+# Parameters
+#
+#   - $1: Compiler to use ('clang' or 'clang++').
+#   - $2: Path to the source file.
+#   - $3: Path to the output executable.
+#
+# Return Value
+#
+#   - On success, returns zero.
+#   - On failure, returns non-zero.
+#
+_build_one_smoke_test() {
+    local compiler="$1"
+    local source="$2"
+    local output="$3"
+    local install_location="${Z_INSTALL_LOCATION:-${DEFAULT_INSTALL_LOCATION}}"
+    local sysroot_location="${Z_SYSROOT_LOCATION:-${install_location}}"
+
+    # The Nanvix user linker script provides the section bounds (e.g.
+    # __eh_frame_start, __init_array_start) that crt0/libunwind reference.
+    local linker_script="${sysroot_location}/lib/user.ld"
+    if [[ ! -f "${linker_script}" ]]; then
+        print_error "Nanvix linker script not found at '${linker_script}'."
+        return 1
+    fi
+
+    print_info "Building $(basename "${source}") -> $(basename "${output}")..."
+    "${install_location}/bin/${compiler}" \
+        --target="${NANVIX_TARGET}" \
+        --sysroot="${sysroot_location}" \
+        -T "${linker_script}" \
+        "${source}" \
+        -o "${output}" || {
+        print_error "Failed to build '${source}'."
+        return 1
+    }
+
+    return 0
+}
+
+#
+# Description
+#
+#   Build-only smoke test: compiles and links the C and C++ smoke-test programs
+#   using the installed toolchain for the Nanvix target. Does not run them.
+#
+# Return Value
+#
+#   - On success, returns zero.
+#   - On failure, returns non-zero.
+#
+# Usage Example
+#
+#   ./z test
+#
+test_build() {
+    local install_location="${Z_INSTALL_LOCATION:-${DEFAULT_INSTALL_LOCATION}}"
+
+    for compiler in clang clang++; do
+        if [[ ! -x "${install_location}/bin/${compiler}" ]]; then
+            print_error "'${install_location}/bin/${compiler}' not found. Build and install the toolchain first."
+            return 1
+        fi
+    done
+
+    local out_dir="${PROJECT_DIR}/build/tests/smoke"
+    mkdir -p "${out_dir}" || {
+        print_error "Failed to create smoke-test output directory '${out_dir}'."
+        return 1
+    }
+
+    _build_one_smoke_test clang   "${PROJECT_DIR}/.nanvix/tests/smoke/hello.c"   "${out_dir}/hello_c.elf"   || return 1
+    _build_one_smoke_test clang++ "${PROJECT_DIR}/.nanvix/tests/smoke/hello.cpp" "${out_dir}/hello_cpp.elf" || return 1
+
+    print_success "Smoke tests built successfully for ${NANVIX_TARGET}."
+    return 0
+}
+
+#==================================================================================================
+# Main Script
+#==================================================================================================
+
+# Intercept the project-specific 'verify' and 'test' commands before delegating
+# to the z framework, whose command set is fixed. These build-only tests run
+# independently of the standard configure/build/install pipeline and do not
+# appear in './z help'.
+case "${1:-}" in
+    verify)
+        _load_project_config 2>/dev/null || true
+        verify_artifacts || exit 1
+        exit 0
+        ;;
+    test)
+        _load_project_config 2>/dev/null || true
+        test_build || exit 1
+        exit 0
+        ;;
+esac
+
+# Run main function with all arguments
+zmain "$@" || {
+    exit 1
+}
+
+exit 0
