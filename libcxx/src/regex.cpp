@@ -308,13 +308,15 @@ struct classnames {
 const classnames ClassNames[] = {
     {"alnum", ctype_base::alnum},
     {"alpha", ctype_base::alpha},
-    {"blank", ctype_base::blank},
+    // Workaround: https://github.com/llvm/llvm-project/issues/54594#issuecomment-1367914522
+    {"blank", static_cast<regex_traits<char>::char_class_type>(ctype_base::blank)},
     {"cntrl", ctype_base::cntrl},
     {"d", ctype_base::digit},
     {"digit", ctype_base::digit},
     {"graph", ctype_base::graph},
     {"lower", ctype_base::lower},
-    {"print", ctype_base::print},
+    // Workaround: https://github.com/llvm/llvm-project/issues/54594#issuecomment-1367914522
+    {"print", static_cast<regex_traits<char>::char_class_type>(ctype_base::print)},
     {"punct", ctype_base::punct},
     {"s", ctype_base::space},
     {"space", ctype_base::space},

@@ -23,7 +23,11 @@
 #include <stdlib.h>
 
 #if defined(_LIBCPP_USING_GETENTROPY)
+#if defined(__nanvix__)
+#  include <unistd.h>
+#else
 #  include <sys/random.h>
+#endif
 #elif defined(_LIBCPP_USING_DEV_RANDOM)
 #  include <fcntl.h>
 #  include <unistd.h>
