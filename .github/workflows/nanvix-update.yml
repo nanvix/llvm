@@ -65,9 +65,9 @@ jobs:
         uses: peter-evans/create-pull-request@v5
         with:
           token: ${{ secrets.DISPATCH_TOKEN }}
-          commit-message: "chore(z): update Nanvix release to ${{ steps.update.outputs.tag }}"
+          commit-message: "[Nanvix] Update release to ${{ steps.update.outputs.tag }}"
           branch: "update/nanvix-${{ steps.update.outputs.tag }}"
-          title: "Update Nanvix release to ${{ steps.update.outputs.tag }}"
+          title: "[Nanvix] Update release to ${{ steps.update.outputs.tag }}"
           body: |
             This PR updates the `z` utility to pin the latest release of `nanvix/nanvix` (${{ steps.update.outputs.tag }}).
 
