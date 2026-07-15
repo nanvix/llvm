@@ -60,6 +60,7 @@ jobs:
       # added as an assignee (not a reviewer) below; a different maintainer — or an
       # admin merge — must satisfy the branch-protection review requirement.
       - name: Create branch and open Pull Request
+        id: create-pr
         if: steps.update.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v5
         with:
@@ -77,3 +78,52 @@ jobs:
           base: ${{ github.ref_name }}
           labels: automated,update
           assignees: ${{ env.PR_ASSIGNEES }}
+
+      - name: Wait for CI to pass
+        id: ci
+        if: steps.create-pr.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+          PR_NUMBER: ${{ steps.create-pr.outputs.pull-request-number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          head_sha="$(gh pr view "${PR_NUMBER}" --repo "${REPOSITORY}" --json headRefOid --jq .headRefOid)"
+          run_id=""
+
+          # The pull_request event may take a few seconds to register its workflow run.
+          for _ in {1..30}; do
+            run_id="$(
+              gh run list \
+                --repo "${REPOSITORY}" \
+                --workflow nanvix-build.yml \
+                --event pull_request \
+                --commit "${head_sha}" \
+                --limit 1 \
+                --json databaseId \
+                --jq '.[0].databaseId // empty'
+            )"
+            [[ -n "${run_id}" ]] && break
+            sleep 10
+          done
+
+          if [[ -z "${run_id}" ]]; then
+            echo "::error::CI/CD Pipeline did not start for commit ${head_sha}"
+            exit 1
+          fi
+
+          gh run watch "${run_id}" --repo "${REPOSITORY}" --exit-status
+          echo "head-sha=${head_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Enable auto-merge
+        if: steps.ci.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+        run: |
+          gh pr merge \
+            --repo "${{ github.repository }}" \
+            --merge \
+            --auto \
+            --match-head-commit "${{ steps.ci.outputs.head-sha }}" \
+            "${{ steps.create-pr.outputs.pull-request-number }}"
