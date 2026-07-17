@@ -58,6 +58,7 @@
 // CHECK-SHARED-SAME: "-shared"
 // CHECK-SHARED-SAME: "-z" "notext"
 // CHECK-SHARED-SAME: "--no-dynamic-linker"
+// CHECK-SHARED-NOT: "-Bstatic"
 // CHECK-SHARED-NOT: crt0.o
 
 // Relocatable link (-r): forward -r and link nothing else (no crt0, no default

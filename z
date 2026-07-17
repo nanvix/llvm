@@ -1938,12 +1938,14 @@ configure_stage1() {
 
     # Config options for libc++.
     local libcxx_options=(
-        -DLIBCXX_ENABLE_SHARED=OFF
+        -DLIBCXX_ENABLE_SHARED=ON
         -DLIBCXX_ENABLE_STATIC=ON
         -DLIBCXX_INCLUDE_TESTS=OFF
         -DLIBCXX_INCLUDE_BENCHMARKS=OFF
         -DLIBCXX_ENABLE_TIME_ZONE_DATABASE=OFF
         -DLIBCXX_HAS_MUSL_LIBC=OFF
+        # Static-only try-compiles cannot verify that libatomic is linkable.
+        -DLIBCXX_HAS_ATOMIC_LIB=OFF
         # Wide characters, localization and <filesystem> are all enabled (no
         # flags needed; libc++ defaults them ON). The Nanvix libc now declares
         # and defines everything these features need: the wide-character API
@@ -1961,7 +1963,7 @@ configure_stage1() {
     # Config options for libunwind.
     local libunwind_options=(
         -DLIBUNWIND_ENABLE_STATIC=ON
-        -DLIBUNWIND_ENABLE_SHARED=OFF
+        -DLIBUNWIND_ENABLE_SHARED=ON
         -DLIBUNWIND_USE_COMPILER_RT=ON
         -DLIBUNWIND_IS_BAREMETAL=ON
         -DLIBUNWIND_ADDITIONAL_COMPILE_FLAGS='-mno-sse;-mno-sse2'
@@ -1972,7 +1974,7 @@ configure_stage1() {
         -DLIBCXXABI_USE_COMPILER_RT=ON
         -DLIBCXXABI_ENABLE_STATIC_UNWINDER=ON
         -DLIBCXXABI_ENABLE_STATIC=ON
-        -DLIBCXXABI_ENABLE_SHARED=OFF
+        -DLIBCXXABI_ENABLE_SHARED=ON
     )
 
     # Use sccache as compiler launcher if available.
@@ -2052,6 +2054,17 @@ build_steps() {
     local build_dir="build"
     if [[ "${Z_STAGE}" == "1" ]]; then
         build_dir="build-runtimes"
+
+        # Shared C++ runtimes link through the Nanvix driver, which resolves
+        # compiler-rt builtins from the installed Clang resource directory.
+        # Bootstrap that archive before Ninja may schedule any shared link.
+        cmake --build "${build_dir}" \
+            --target install-builtins \
+            -j "${parallel_build_option}" \
+            -v || {
+            print_error "Failed to bootstrap compiler-rt builtins."
+            return 1
+        }
     fi
 
     cmake --build "${build_dir}" -j "${parallel_build_option}" -v || {
@@ -2477,8 +2490,11 @@ verify_artifacts() {
     print_info "Verifying toolchain artifacts in '${install_location}'..."
     local failed=0
 
-    # C++ runtime libraries.
-    for lib in libc++.a libc++abi.a libunwind.a; do
+    # C++ runtime libraries (static archives, linker entries, and SONAMEs).
+    for lib in \
+        libc++.a libc++.so libc++.so.1 \
+        libc++abi.a libc++abi.so libc++abi.so.1 \
+        libunwind.a libunwind.so libunwind.so.1; do
         if [[ ! -f "${install_location}/lib/${lib}" ]]; then
             print_error "Missing runtime library '${install_location}/lib/${lib}'."
             failed=1
@@ -2514,6 +2530,7 @@ verify_artifacts() {
 #   - $1: Compiler to use ('clang' or 'clang++').
 #   - $2: Path to the source file.
 #   - $3: Path to the output executable.
+#   - $4...: Additional compiler or linker arguments.
 #
 # Return Value
 #
@@ -2524,6 +2541,7 @@ _build_one_smoke_test() {
     local compiler="$1"
     local source="$2"
     local output="$3"
+    local extra_args=("${@:4}")
     local install_location="${Z_INSTALL_LOCATION:-${DEFAULT_INSTALL_LOCATION}}"
     local sysroot_location="${Z_SYSROOT_LOCATION:-${install_location}}"
 
@@ -2541,6 +2559,7 @@ _build_one_smoke_test() {
         --sysroot="${sysroot_location}" \
         -T "${linker_script}" \
         "${source}" \
+        "${extra_args[@]}" \
         -o "${output}" || {
         print_error "Failed to build '${source}'."
         return 1
@@ -2552,8 +2571,46 @@ _build_one_smoke_test() {
 #
 # Description
 #
-#   Build-only smoke test: compiles and links the C and C++ smoke-test programs
-#   using the installed toolchain for the Nanvix target. Does not run them.
+#   Compiles and links one shared-library smoke test for the Nanvix target.
+#
+# Parameters
+#
+#   - $1: Path to the source file.
+#   - $2: Path to the output shared object.
+#
+# Return Value
+#
+#   - On success, returns zero.
+#   - On failure, returns non-zero.
+#
+_build_shared_smoke_test() {
+    local source="$1"
+    local output="$2"
+    local install_location="${Z_INSTALL_LOCATION:-${DEFAULT_INSTALL_LOCATION}}"
+    local sysroot_location="${Z_SYSROOT_LOCATION:-${install_location}}"
+
+    print_info "Building $(basename "${source}") -> $(basename "${output}")..."
+    "${install_location}/bin/clang" \
+        --target="${NANVIX_TARGET}" \
+        --sysroot="${sysroot_location}" \
+        -fPIC \
+        -shared \
+        "-Wl,-soname,$(basename "${output}")" \
+        "${source}" \
+        -o "${output}" || {
+        print_error "Failed to build shared library '${source}'."
+        return 1
+    }
+
+    return 0
+}
+
+#
+# Description
+#
+#   Build-only smoke test: compiles and links static executables, a shared
+#   library, and a dynamically linked C++ executable using the installed
+#   toolchain for the Nanvix target. Does not run them.
 #
 # Return Value
 #
@@ -2582,6 +2639,20 @@ test_build() {
 
     _build_one_smoke_test clang   "${PROJECT_DIR}/.nanvix/tests/smoke/hello.c"   "${out_dir}/hello_c.elf"   || return 1
     _build_one_smoke_test clang++ "${PROJECT_DIR}/.nanvix/tests/smoke/hello.cpp" "${out_dir}/hello_cpp.elf" || return 1
+
+    local shared_library="${out_dir}/libhello.so"
+    _build_shared_smoke_test "${PROJECT_DIR}/.nanvix/tests/smoke/shared.c" "${shared_library}" || return 1
+    _build_one_smoke_test clang++ \
+        "${PROJECT_DIR}/.nanvix/tests/smoke/dynamic.cpp" \
+        "${out_dir}/hello_dynamic.elf" \
+        -fPIE \
+        -nostdlib++ \
+        -Wl,-pie,--export-dynamic,--hash-style=sysv,-z,notext,-z,norelro,-Bdynamic \
+        "${shared_library}" \
+        "${install_location}/lib/libc++.so.1" \
+        "${install_location}/lib/libc++abi.so.1" \
+        "${install_location}/lib/libunwind.so.1" \
+        -Wl,-Bstatic,--no-dynamic-linker || return 1
 
     print_success "Smoke tests built successfully for ${NANVIX_TARGET}."
     return 0

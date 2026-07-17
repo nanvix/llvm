@@ -79,7 +79,8 @@ void nanvix::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     // Nanvix executables are static ELF; force archive selection so -lc/-lm
     // pick libc.a/libm.a even when libc.so/libm.so sit in the same lib
     // directory.
-    CmdArgs.push_back("-Bstatic");
+    if (!IsShared)
+      CmdArgs.push_back("-Bstatic");
 
     CmdArgs.push_back("--eh-frame-hdr");
     CmdArgs.push_back("--gc-sections");
