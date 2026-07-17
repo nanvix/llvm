@@ -157,9 +157,11 @@ $INSTALL/
 
 `./z test` compiles and links all four for `i686-unknown-nanvix` using the
 installed toolchain (it does not run them). The dynamic test names the versioned
-runtime shared objects explicitly so the driver cannot fall back to static
-archives. `./z verify` checks that the expected static and shared runtime
-artifacts were installed.
+runtime shared objects explicitly and brackets them with `-Bdynamic`/`-Bstatic`
+so the driver cannot fall back to archives while the default system libraries
+remain static. It also suppresses `PT_INTERP`, matching Nanvix's startup
+self-linking model. `./z verify` checks that the expected static and shared
+runtime artifacts were installed.
 
 ## Building the toolchain
 

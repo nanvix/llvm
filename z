@@ -2646,10 +2646,12 @@ test_build() {
         "${PROJECT_DIR}/.nanvix/tests/smoke/dynamic.cpp" \
         "${out_dir}/hello_dynamic.elf" \
         -nostdlib++ \
+        -Wl,-Bdynamic \
         "${shared_library}" \
         "${install_location}/lib/libc++.so.1" \
         "${install_location}/lib/libc++abi.so.1" \
-        "${install_location}/lib/libunwind.so.1" || return 1
+        "${install_location}/lib/libunwind.so.1" \
+        -Wl,-Bstatic,--no-dynamic-linker || return 1
 
     print_success "Smoke tests built successfully for ${NANVIX_TARGET}."
     return 0
