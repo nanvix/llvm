@@ -2052,6 +2052,17 @@ build_steps() {
     local build_dir="build"
     if [[ "${Z_STAGE}" == "1" ]]; then
         build_dir="build-runtimes"
+
+        # Shared C++ runtimes link through the Nanvix driver, which resolves
+        # compiler-rt builtins from the installed Clang resource directory.
+        # Bootstrap that archive before Ninja may schedule any shared link.
+        cmake --build "${build_dir}" \
+            --target install-builtins \
+            -j "${parallel_build_option}" \
+            -v || {
+            print_error "Failed to bootstrap compiler-rt builtins."
+            return 1
+        }
     fi
 
     cmake --build "${build_dir}" -j "${parallel_build_option}" -v || {
