@@ -67,9 +67,12 @@ Uses the freshly built stage 0 Clang to cross-compile the LLVM runtimes for
 Nanvix:
 
 - `compiler-rt` (builtins only — baremetal build, no sanitizers/profile/etc.)
-- `libunwind` (static)
-- `libc++abi` (static)
-- `libc++` (static)
+- `libunwind` (static and shared)
+- `libc++abi` (static and shared)
+- `libc++` (static and shared)
+
+Executable links continue to use the static variants by default. The shared
+variants are available for libraries and plugins loaded with `dlopen`.
 
 Before configuring, stage 1 stages the **Nanvix C library** into the sysroot:
 the in-source headers (`include/`), the C/math libraries (`libc.a`, `libm.a`,
@@ -136,7 +139,7 @@ and the install prefix gains the LLVM runtimes:
 $INSTALL/
 ├── bin/             # clang, clang++, lld, ...
 └── lib/
-    ├── libc++.a, libc++abi.a, libunwind.a
+    ├── libc++.{a,so*}, libc++abi.{a,so*}, libunwind.{a,so*}
     └── clang/<ver>/lib/i686-unknown-nanvix/libclang_rt.builtins*.a
 ```
 
@@ -148,9 +151,14 @@ $INSTALL/
 - `hello.cpp` — a minimal C++ program exercising `new`/`delete` (libc++abi) and
   `std::printf` (libc), linked against libc++, libc++abi, libunwind, and
   compiler-rt.
+- `shared.c` — a position-independent C library linked as `libhello.so`.
+- `dynamic.cpp` — a C++ executable linked against `libhello.so` and the shared
+  libc++, libc++abi, and libunwind runtimes.
 
-`./z test` compiles and links both for `i686-unknown-nanvix` using the installed
-toolchain (it does not run them). `./z verify` checks that the expected runtime
+`./z test` compiles and links all four for `i686-unknown-nanvix` using the
+installed toolchain (it does not run them). The dynamic test names the versioned
+runtime shared objects explicitly so the driver cannot fall back to static
+archives. `./z verify` checks that the expected static and shared runtime
 artifacts were installed.
 
 ## Building the toolchain
@@ -208,11 +216,12 @@ release you are building with.
   flip the corresponding `COMPILER_RT_BUILD_*` flags in `z` selectively
   (profile/coverage first, then UBSan, then ASan).
 
-- **No dynamic loader (static-ELF only)**.
+- **No system dynamic loader (executables are static ELF only)**.
   The driver forces `-Bstatic`, emits no ELF interpreter (`--no-dynamic-linker`
-  on `-shared` links), and suppresses `RELRO`/build-id/rosegment. Nanvix already
-  has `dlopen` and i686 startup self-linking of an executable's `DT_NEEDED`
-  dependencies, but no `PT_INTERP` system dynamic linker.
+  on `-shared` links), and suppresses `RELRO`/build-id/rosegment. Shared runtime
+  libraries can be loaded explicitly with `dlopen`, and Nanvix has i686 startup
+  self-linking of an executable's `DT_NEEDED` dependencies, but no `PT_INTERP`
+  system dynamic linker.
   *Change once*: the Nanvix startup dynamic-linking epic lands
   ([nanvix/nanvix#2782](https://github.com/nanvix/nanvix/issues/2782), driver
   item [#2771](https://github.com/nanvix/nanvix/issues/2771)) — then add an
