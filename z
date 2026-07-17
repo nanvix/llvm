@@ -1747,7 +1747,7 @@ readonly NANVIX_SRC="${Z_NANVIX_SRC:-}"
 readonly NANVIX_LIBS=(crt0.o libc.a libm.a libc.so libm.so libnvx_crt0.a libdl.a libpthread.a librt.a)
 # Nanvix release used in CI when no source tree is present: a tarball whose
 # root holds include/ + lib/ (libc.a/libm.a/libc.so/libm.so/crt0.o/user.ld...).
-readonly NANVIX_RELEASE_TAG="${Z_NANVIX_RELEASE_TAG:-v0.20.13}"
+readonly NANVIX_RELEASE_TAG="${Z_NANVIX_RELEASE_TAG:-v0.21.4}"
 readonly NANVIX_RELEASE_PATTERN="nanvix-x86-microvm-standalone-release-*.tar.bz2"
 
 #==================================================================================================
