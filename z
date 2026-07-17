@@ -2645,8 +2645,9 @@ test_build() {
     _build_one_smoke_test clang++ \
         "${PROJECT_DIR}/.nanvix/tests/smoke/dynamic.cpp" \
         "${out_dir}/hello_dynamic.elf" \
+        -fPIE \
         -nostdlib++ \
-        -Wl,-Bdynamic \
+        -Wl,-pie,--export-dynamic,--hash-style=sysv,-z,notext,-z,norelro,-Bdynamic \
         "${shared_library}" \
         "${install_location}/lib/libc++.so.1" \
         "${install_location}/lib/libc++abi.so.1" \

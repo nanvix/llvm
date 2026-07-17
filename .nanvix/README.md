@@ -159,9 +159,9 @@ $INSTALL/
 installed toolchain (it does not run them). The dynamic test names the versioned
 runtime shared objects explicitly and brackets them with `-Bdynamic`/`-Bstatic`
 so the driver cannot fall back to archives while the default system libraries
-remain static. It also suppresses `PT_INTERP`, matching Nanvix's startup
-self-linking model. `./z verify` checks that the expected static and shared
-runtime artifacts were installed.
+remain static. The executable uses Nanvix's established PIE self-linking flags,
+including SysV hashing and no `PT_INTERP`. `./z verify` checks that the expected
+static and shared runtime artifacts were installed.
 
 ## Building the toolchain
 
