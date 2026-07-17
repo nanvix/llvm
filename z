@@ -1944,6 +1944,8 @@ configure_stage1() {
         -DLIBCXX_INCLUDE_BENCHMARKS=OFF
         -DLIBCXX_ENABLE_TIME_ZONE_DATABASE=OFF
         -DLIBCXX_HAS_MUSL_LIBC=OFF
+        # Static-only try-compiles cannot verify that libatomic is linkable.
+        -DLIBCXX_HAS_ATOMIC_LIB=OFF
         # Wide characters, localization and <filesystem> are all enabled (no
         # flags needed; libc++ defaults them ON). The Nanvix libc now declares
         # and defines everything these features need: the wide-character API
