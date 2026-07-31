@@ -82,6 +82,12 @@ void nanvix::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     if (!IsShared)
       CmdArgs.push_back("-Bstatic");
 
+    // Nanvix has no system dynamic loader. Materialize ELF64 RELA addends in
+    // executable images so startup self-linking begins from their link-time
+    // values while retaining the dynamic relocations it needs to rebind.
+    if (!IsShared && ToolChain.getTriple().getArch() == llvm::Triple::x86_64)
+      CmdArgs.push_back("--apply-dynamic-relocs");
+
     CmdArgs.push_back("--eh-frame-hdr");
     CmdArgs.push_back("--gc-sections");
 
@@ -145,17 +151,18 @@ void nanvix::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   // the default startup environment, and when the user already passed -T.
   if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nostartfiles,
                    options::OPT_r) &&
-      !IsShared && !Args.hasArg(options::OPT_T)) {
-    // Probe only the toolchain file-search paths (the sysroot lib/ dirs), not
-    // the broader GetFilePath() locations (-B prefixes, ResourceDir, the
-    // compiler-rt dir), so nothing but the sysroot's own script is picked up;
-    // a stray user.ld in the working directory is likewise ignored.  When the
-    // script is absent the link falls back to the clearer crt0/libc missing-
-    // symbol error instead of gaining a dangling --default-script argument.  A
-    // script supplied via -Wl,-T is invisible to the driver, so this omission
-    // is intentionally silent.
-    for (const auto &Dir : ToolChain.getFilePaths()) {
-      SmallString<128> Script(Dir);
+      !IsShared && !Args.hasArg(options::OPT_T) && !D.SysRoot.empty()) {
+    // Probe only the sysroot lib directories, not the broader GetFilePath()
+    // locations (-B prefixes, ResourceDir, the compiler-rt dir, or the
+    // installed toolchain lib dir), so nothing but the sysroot's own script is
+    // picked up; a stray user.ld in the working directory is likewise ignored.
+    // When the script is absent the link falls back to the clearer crt0/libc
+    // missing-symbol error instead of gaining a dangling --default-script
+    // argument. A script supplied via -Wl,-T is invisible to the driver, so
+    // this omission is intentionally silent.
+    for (const char *Dir : {"lib", "usr/lib"}) {
+      SmallString<128> Script(D.SysRoot);
+      llvm::sys::path::append(Script, Dir);
       llvm::sys::path::append(Script, "user.ld");
       if (ToolChain.getVFS().exists(Script)) {
         CmdArgs.push_back("--default-script");
@@ -182,6 +189,13 @@ Nanvix::Nanvix(const Driver &D, const llvm::Triple &Triple, const ArgList &Args)
 
   getProgramPaths().push_back(getDriver().Dir);
 
+  // Stage 1 installs libc++, libc++abi, and libunwind next to the compiler
+  // under <toolchain>/lib, while the Nanvix C library remains in the sysroot.
+  SmallString<128> ToolchainLibDir(getDriver().Dir);
+  llvm::sys::path::append(ToolchainLibDir, "..", "lib");
+  if (getVFS().exists(ToolchainLibDir))
+    getFilePaths().push_back(std::string(ToolchainLibDir));
+
   if (!D.SysRoot.empty()) {
     // Nanvix ships its in-source C library (crt0.o, libc.a, libm.a, the
     // libdl/libpthread/librt stubs) and the LLVM stage-1 runtimes (libc++,
@@ -197,10 +211,31 @@ Nanvix::Nanvix(const Driver &D, const llvm::Triple &Triple, const ArgList &Args)
   }
 }
 
+DerivedArgList *
+Nanvix::TranslateArgs(const DerivedArgList &Args, StringRef BoundArch,
+                      Action::OffloadKind DeviceOffloadKind) const {
+  DerivedArgList *DAL =
+      Generic_ELF::TranslateArgs(Args, BoundArch, DeviceOffloadKind);
+
+  if (getArch() != llvm::Triple::x86_64 ||
+      Args.hasArg(options::OPT_mred_zone, options::OPT_mno_red_zone))
+    return DAL;
+
+  if (!DAL) {
+    DAL = new DerivedArgList(Args.getBaseArgs());
+    for (Arg *A : Args)
+      DAL->append(A);
+  }
+
+  const OptTable &Opts = getDriver().getOpts();
+  DAL->AddFlagArg(nullptr, Opts.getOption(options::OPT_mno_red_zone));
+  return DAL;
+}
+
 std::string Nanvix::getCompilerRTPath() const {
   // Compiler-rt builtins are installed in a per-target directory
-  // (e.g., lib/clang/21/lib/i686-unknown-nanvix/) but may use the
-  // old naming convention (libclang_rt.builtins-i386.a). Point the
+  // (e.g., lib/clang/21/lib/x86_64-unknown-nanvix/) but may use an old
+  // arch-suffixed naming convention. Point the
   // fallback path at the per-target directory so the arch-suffixed
   // name is found.
   SmallString<128> Path(getDriver().ResourceDir);

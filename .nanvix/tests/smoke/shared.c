@@ -5,7 +5,7 @@
 
 /*
  * Build smoke test: verify that Clang can emit a shared object for the
- * i686-unknown-nanvix target.
+ * configured Nanvix target.
  */
 
 int nanvix_smoke_shared_value(void)

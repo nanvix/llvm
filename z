@@ -776,6 +776,8 @@ readonly PARALLEL_BUILD_OPT_NAME="--parallel-build"
 readonly RELEASE_NAME_OPT_NAME="--release-name"
 # Name for stage option.
 readonly STAGE_OPT_NAME="--stage"
+# Name for target option.
+readonly TARGET_OPT_NAME="--target"
 # Name for sysroot location option.
 readonly SYSROOT_LOCATION_OPT_NAME="--sysroot-location"
 
@@ -1294,7 +1296,7 @@ Utility for building and installing ${Z_PROJECT_NAME} for Nanvix.
 
 Usage: ./z COMMAND   [OPTIONS]
        ./z ${BUILD_CMD_NAME}
-       ./z ${CONFIGURE_CMD_NAME} [${PARALLEL_BUILD_OPT_NAME}=N] [${INSTALL_LOCATION_OPT_NAME}=PATH] [${SYSROOT_LOCATION_OPT_NAME}=PATH] [${STAGE_OPT_NAME}=N]
+    ./z ${CONFIGURE_CMD_NAME} [${PARALLEL_BUILD_OPT_NAME}=N] [${INSTALL_LOCATION_OPT_NAME}=PATH] [${SYSROOT_LOCATION_OPT_NAME}=PATH] [${STAGE_OPT_NAME}=N] [${TARGET_OPT_NAME}=TARGET]
        ./z ${HELP_CMD_NAME}
        ./z ${INSTALL_CMD_NAME}
        ./z ${RELEASE_CMD_NAME}
@@ -1318,6 +1320,7 @@ Options:
   ${RELEASE_NAME_OPT_NAME}=NAME      Set the release name to 'NAME'          (defaults to '${default_release_name}')
   ${STAGE_OPT_NAME}=N                Set build stage to 'N'                  (defaults to '${DEFAULT_STAGE}')
   ${SYSROOT_LOCATION_OPT_NAME}=PATH  Set sysroot location to 'PATH'          (defaults to '${DEFAULT_SYSROOT_LOCATION}')
+  ${TARGET_OPT_NAME}=TARGET          Set target architecture to 'TARGET'     (defaults to '${DEFAULT_TARGET}')
 EOF
 }
 
@@ -1357,6 +1360,10 @@ _parse_project_args() {
             "${STAGE_OPT_NAME}="*)
                 # shellcheck disable=SC2034
                 Z_STAGE="${1#*=}"
+                shift
+                ;;
+            "${TARGET_OPT_NAME}="*)
+                Z_TARGET="${1#*=}"
                 shift
                 ;;
             "${SYSROOT_LOCATION_OPT_NAME}="*)
@@ -1735,10 +1742,13 @@ BUILD_TARGETS=("all")
 # Install Targets
 INSTALL_TARGETS=("install")
 
-# Target triple for the Nanvix toolchain. Kept in a single place so the stage 0
-# default triple, the stage 1 cross-compile target, and the compiler-rt install
-# directory stay in sync with the clang driver's getTriple().str().
-readonly NANVIX_TARGET="i686-unknown-nanvix"
+# Resolved target settings. Keep these in sync so the stage 0 default triple,
+# stage 1 cross-compile target, Nanvix sysroot, and compiler-rt install directory
+# always describe the same architecture.
+NANVIX_ARCH=""
+NANVIX_PROCESSOR=""
+NANVIX_RELEASE_PATTERN=""
+NANVIX_TARGET=""
 
 # Nanvix source tree providing the in-source libc, headers, and user linker
 # script. Set via Z_NANVIX_SRC.
@@ -1748,11 +1758,62 @@ readonly NANVIX_LIBS=(crt0.o libc.a libm.a libc.so libm.so libnvx_crt0.a libdl.a
 # Nanvix release used in CI when no source tree is present: a tarball whose
 # root holds include/ + lib/ (libc.a/libm.a/libc.so/libm.so/crt0.o/user.ld...).
 readonly NANVIX_RELEASE_TAG="${Z_NANVIX_RELEASE_TAG:-v0.23.6}"
-readonly NANVIX_RELEASE_PATTERN="nanvix-x86-microvm-standalone-release-*.tar.bz2"
 
 #==================================================================================================
 # Project-Specific Functions
 #==================================================================================================
+
+#
+# Description
+#
+#   Resolves the configured target into the names used by LLVM and Nanvix.
+#
+resolve_nanvix_target() {
+    case "${Z_TARGET}" in
+        i686|x86|i686-nanvix|x86-nanvix|i686-unknown-nanvix)
+            Z_TARGET="i686-nanvix"
+            NANVIX_ARCH="x86"
+            NANVIX_PROCESSOR="i686"
+            NANVIX_TARGET="i686-unknown-nanvix"
+            ;;
+        x86_64|x86_64-nanvix|x86_64-unknown-nanvix)
+            Z_TARGET="x86_64-nanvix"
+            NANVIX_ARCH="x86_64"
+            NANVIX_PROCESSOR="x86_64"
+            NANVIX_TARGET="x86_64-unknown-nanvix"
+            ;;
+        *)
+            print_error "Unsupported target '${Z_TARGET}'. Expected 'i686-nanvix' or 'x86_64-nanvix'."
+            return 1
+            ;;
+    esac
+
+    NANVIX_RELEASE_PATTERN="nanvix-${NANVIX_ARCH}-microvm-standalone-release-*.tar.bz2"
+    return 0
+}
+
+#
+# Description
+#
+#   Verifies that a staged Nanvix ELF object has the configured ELF class.
+#
+validate_nanvix_elf_class() {
+    local object_path=$1
+    local expected_class=1
+    if [[ "${NANVIX_ARCH}" == "x86_64" ]]; then
+        expected_class=2
+    fi
+
+    local actual_class
+    actual_class=$(od -An -t u1 -j 4 -N 1 "${object_path}" 2>/dev/null | tr -d '[:space:]')
+    if [[ "${actual_class}" != "${expected_class}" ]]; then
+        print_error "'${object_path}' does not match ${NANVIX_TARGET}."
+        print_error "Build Nanvix with 'TARGET=${NANVIX_ARCH}' before configuring stage 1."
+        return 1
+    fi
+
+    return 0
+}
 
 #
 # Description
@@ -1765,6 +1826,8 @@ readonly NANVIX_RELEASE_PATTERN="nanvix-x86-microvm-standalone-release-*.tar.bz2
 #   - On failure, this function returns non-zero.
 #
 download_steps() {
+    resolve_nanvix_target || return 1
+
     # Stage 0 (compiler only): no sysroot needed.
     if [[ "${Z_STAGE}" == "0" ]]; then
         print_info "Stage 0: no dependencies to download."
@@ -1815,6 +1878,8 @@ download_steps() {
             return 1
         fi
 
+        validate_nanvix_elf_class "${nanvix_src}/lib/crt0.o" || return 1
+
         # C headers.
         if [[ ! -f "${nanvix_src}/include/stdlib.h" ]]; then
             print_error "Nanvix headers not found at '${nanvix_src}/include'."
@@ -1844,8 +1909,8 @@ download_steps() {
         # build path for a source checkout.
         if [[ -f "${nanvix_src}/lib/user.ld" ]]; then
             install -m 644 "${nanvix_src}/lib/user.ld" "${sysroot_location}/lib/"
-        elif [[ -f "${nanvix_src}/build/user/linker/x86/user.ld" ]]; then
-            install -m 644 "${nanvix_src}/build/user/linker/x86/user.ld" "${sysroot_location}/lib/"
+        elif [[ -f "${nanvix_src}/build/user/linker/${NANVIX_ARCH}/user.ld" ]]; then
+            install -m 644 "${nanvix_src}/build/user/linker/${NANVIX_ARCH}/user.ld" "${sysroot_location}/lib/"
         else
             print_error "Failed to locate user.ld in '${nanvix_src}'."
             return 1
@@ -1966,8 +2031,12 @@ configure_stage1() {
         -DLIBUNWIND_ENABLE_SHARED=ON
         -DLIBUNWIND_USE_COMPILER_RT=ON
         -DLIBUNWIND_IS_BAREMETAL=ON
-        -DLIBUNWIND_ADDITIONAL_COMPILE_FLAGS='-mno-sse;-mno-sse2'
     )
+    if [[ "${NANVIX_ARCH}" == "x86" ]]; then
+        libunwind_options+=(
+            -DLIBUNWIND_ADDITIONAL_COMPILE_FLAGS='-mno-sse;-mno-sse2'
+        )
+    fi
 
     # Config options for libcxxabi.
     local libcxxabi_options=(
@@ -1989,6 +2058,7 @@ configure_stage1() {
     cmake -S runtimes -B build-runtimes -G Ninja \
         -DCMAKE_VERBOSE_MAKEFILE=ON \
         -DCMAKE_SYSTEM_NAME=Nanvix \
+        -DCMAKE_SYSTEM_PROCESSOR="${NANVIX_PROCESSOR}" \
         -DCMAKE_MODULE_PATH="${SCRIPT_DIR}/cmake/nanvix" \
         -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
         -DCMAKE_C_COMPILER="${Z_INSTALL_LOCATION}/bin/clang" \
@@ -2022,9 +2092,11 @@ configure_stage1() {
 #
 # Usage Example
 #
-#   configure_steps "i686-nanvix" "/usr/local"
+#   configure_steps
 #
 configure_steps() {
+    resolve_nanvix_target || return 1
+
     if [[ "${Z_STAGE}" == "0" ]]; then
         configure_stage0
     elif [[ "${Z_STAGE}" == "1" ]]; then
@@ -2485,6 +2557,8 @@ update_steps() {
 #   ./z verify
 #
 verify_artifacts() {
+    resolve_nanvix_target || return 1
+
     local install_location="${Z_INSTALL_LOCATION:-${DEFAULT_INSTALL_LOCATION}}"
 
     print_info "Verifying toolchain artifacts in '${install_location}'..."
@@ -2622,6 +2696,8 @@ _build_shared_smoke_test() {
 #   ./z test
 #
 test_build() {
+    resolve_nanvix_target || return 1
+
     local install_location="${Z_INSTALL_LOCATION:-${DEFAULT_INSTALL_LOCATION}}"
 
     for compiler in clang clang++; do
@@ -2631,7 +2707,7 @@ test_build() {
         fi
     done
 
-    local out_dir="${PROJECT_DIR}/build/tests/smoke"
+    local out_dir="${PROJECT_DIR}/build/tests/smoke/${NANVIX_PROCESSOR}"
     mkdir -p "${out_dir}" || {
         print_error "Failed to create smoke-test output directory '${out_dir}'."
         return 1
@@ -2642,12 +2718,26 @@ test_build() {
 
     local shared_library="${out_dir}/libhello.so"
     _build_shared_smoke_test "${PROJECT_DIR}/.nanvix/tests/smoke/shared.c" "${shared_library}" || return 1
+    local pie_option="-fPIE"
+    local linker_option="-pie"
+    if [[ "${NANVIX_ARCH}" == "x86_64" ]]; then
+        # The installed x86_64 crt0/libc archives use the static relocation
+        # model, so keep the executable fixed-address while retaining its
+        # DT_NEEDED dependencies. LLD must materialize ELF64 RELA addends because
+        # Nanvix deliberately has no system dynamic loader to do so.
+        pie_option="-fno-PIE"
+        linker_option="--apply-dynamic-relocs"
+    fi
+    local dynamic_args=(
+        "${pie_option}"
+        -nostdlib++
+        "-Wl,--export-dynamic,${linker_option},--hash-style=sysv,-z,notext,-z,norelro,-Bdynamic"
+    )
+
     _build_one_smoke_test clang++ \
         "${PROJECT_DIR}/.nanvix/tests/smoke/dynamic.cpp" \
         "${out_dir}/hello_dynamic.elf" \
-        -fPIE \
-        -nostdlib++ \
-        -Wl,-pie,--export-dynamic,--hash-style=sysv,-z,notext,-z,norelro,-Bdynamic \
+        "${dynamic_args[@]}" \
         "${shared_library}" \
         "${install_location}/lib/libc++.so.1" \
         "${install_location}/lib/libc++abi.so.1" \
