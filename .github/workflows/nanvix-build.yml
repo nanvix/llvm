@@ -44,7 +44,14 @@ env:
 
 jobs:
   build:
+    name: Build and test (${{ matrix.target }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - i686-nanvix
+          - x86_64-nanvix
 
     steps:
     - name: Checkout code
@@ -56,6 +63,7 @@ jobs:
     - name: Build and test toolchain
       uses: ./.github/actions/nanvix-build
       with:
+        target: ${{ matrix.target }}
         install-location: ${{ env.INSTALL_LOCATION }}
-        cache-key: ${{ runner.os }}-sccache
-        cache-restore-keys: ${{ runner.os }}-sccache
+        cache-key: ${{ runner.os }}-${{ matrix.target }}-sccache
+        cache-restore-keys: ${{ runner.os }}-${{ matrix.target }}-sccache

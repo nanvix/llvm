@@ -49,6 +49,10 @@ public:
   bool HasNativeLLVMSupport() const override { return true; }
   bool IsMathErrnoDefault() const override { return false; }
 
+  llvm::opt::DerivedArgList *
+  TranslateArgs(const llvm::opt::DerivedArgList &Args, StringRef BoundArch,
+                Action::OffloadKind DeviceOffloadKind) const override;
+
   std::string getCompilerRTPath() const override;
 
   const char *getDefaultLinker() const override { return "ld.lld"; }

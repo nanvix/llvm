@@ -5,8 +5,8 @@
 
 /*
  * Build smoke test: verify that a C program compiles and links against the
- * in-source Nanvix C library and compiler-rt builtins for the
- * i686-unknown-nanvix target.
+ * in-source Nanvix C library and compiler-rt builtins for the configured
+ * Nanvix target.
  */
 
 #include <stdio.h>

@@ -54,22 +54,23 @@ env:
 #==================================================================================================
 
 jobs:
-  release:
+  prepare:
+    name: Prepare release
     runs-on: ubuntu-24.04
-
     permissions:
-      contents: write
+      contents: read
+
+    outputs:
+      exists: ${{ steps.check_release.outputs.exists }}
+      release_name: ${{ steps.commit_info.outputs.release_name }}
+      short_sha: ${{ steps.commit_info.outputs.short_sha }}
+      tag_name: ${{ steps.commit_info.outputs.tag_name }}
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
-
-    - name: Setup Git configuration
-      run: |
-        git config --global user.name "github-actions[bot]"
-        git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
     - name: Get commit information
       id: commit_info
@@ -92,9 +93,24 @@ jobs:
           echo "exists=false" >> $GITHUB_OUTPUT
         fi
 
-    #----------------------------------------------------------------------------------------------
-    # Build (stage 0 compiler -> stage 1 runtimes + in-source Nanvix libc)
-    #----------------------------------------------------------------------------------------------
+  build:
+    name: Build release (${{ matrix.target }})
+    needs: prepare
+    if: needs.prepare.outputs.exists == 'false'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - i686-nanvix
+          - x86_64-nanvix
+
+    permissions:
+      contents: read
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
 
     # Build stage 0 + stage 1, install into INSTALL_LOCATION, and run the
     # build-only smoke tests. The shared build/test sequence lives in the
@@ -102,33 +118,59 @@ jobs:
     # nanvix-build.yml) and runs in this job, so the installed toolchain remains
     # available to the release/packaging steps below.
     - name: Build and test toolchain
-      if: steps.check_release.outputs.exists == 'false'
       uses: ./.github/actions/nanvix-build
       with:
+        target: ${{ matrix.target }}
         install-location: ${{ env.INSTALL_LOCATION }}
-        release-name: ${{ steps.commit_info.outputs.release_name }}
-        cache-key: ${{ runner.os }}-sccache-release-${{ github.sha }}
+        release-name: ${{ needs.prepare.outputs.release_name }}-${{ matrix.target }}
+        cache-key: ${{ runner.os }}-${{ matrix.target }}-sccache-release-${{ github.sha }}
         cache-restore-keys: |
-          ${{ runner.os }}-sccache-release-
-          ${{ runner.os }}-sccache
-
-    #----------------------------------------------------------------------------------------------
-    # Release Artifact (tarball)
-    #----------------------------------------------------------------------------------------------
+          ${{ runner.os }}-${{ matrix.target }}-sccache-release-
+          ${{ runner.os }}-${{ matrix.target }}-sccache
 
     # `./z release` builds the toolchain and creates the release tarball.
     - name: Create release artifacts
-      if: steps.check_release.outputs.exists == 'false'
       run: ./z release
 
-    #----------------------------------------------------------------------------------------------
-    # Git Tag + GitHub Release
-    #----------------------------------------------------------------------------------------------
+    - name: Upload release artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: nanvix-toolchain-${{ matrix.target }}
+        path: .nanvix/out/${{ needs.prepare.outputs.release_name }}-${{ matrix.target }}.tar.bz2
+        if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.exists == 'false'
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download release artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: nanvix-toolchain-*
+        path: .nanvix/out
+        merge-multiple: true
+
+    - name: Setup Git configuration
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
     - name: Create release tag
-      if: steps.check_release.outputs.exists == 'false'
       run: |
-        TAG_NAME="${{ steps.commit_info.outputs.tag_name }}"
+        TAG_NAME="${{ needs.prepare.outputs.tag_name }}"
         if git rev-parse -q --verify "refs/tags/${TAG_NAME}" >/dev/null; then
           echo "Tag ${TAG_NAME} already exists locally; skipping tag creation."
         else
@@ -137,22 +179,23 @@ jobs:
         fi
 
     - name: Create GitHub Release
-      if: steps.check_release.outputs.exists == 'false'
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: ${{ steps.commit_info.outputs.tag_name }}
-        name: "${{ steps.commit_info.outputs.tag_name }}"
+        tag_name: ${{ needs.prepare.outputs.tag_name }}
+        name: "${{ needs.prepare.outputs.tag_name }}"
         body: |
           Automated release of the Nanvix LLVM ${{ env.LLVM_VERSION }} toolchain.
 
-          Built from commit: ${{ steps.commit_info.outputs.short_sha }}
+          Built from commit: ${{ needs.prepare.outputs.short_sha }}
 
-          This toolchain targets the Nanvix operating system (i686-unknown-nanvix)
-          and bundles the in-source Nanvix C library and headers.
+          These toolchains target the Nanvix operating system and bundle the
+          matching in-source Nanvix C library and headers.
 
           **Artifacts:**
-          - Tarball: `${{ steps.commit_info.outputs.release_name }}.tar.bz2`
+          - i686: `${{ needs.prepare.outputs.release_name }}-i686-nanvix.tar.bz2`
+          - x86_64: `${{ needs.prepare.outputs.release_name }}-x86_64-nanvix.tar.bz2`
         files: |
-          .nanvix/out/${{ steps.commit_info.outputs.release_name }}.tar.bz2
+          .nanvix/out/${{ needs.prepare.outputs.release_name }}-i686-nanvix.tar.bz2
+          .nanvix/out/${{ needs.prepare.outputs.release_name }}-x86_64-nanvix.tar.bz2
         draft: false
         prerelease: false

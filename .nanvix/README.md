@@ -6,12 +6,13 @@ and how the toolchain is built.
 
 ## Overview
 
-The port turns upstream LLVM into a cross-toolchain that produces static ELF
-executables for **Nanvix**, a Unix-like research operating system. The target
-triple is:
+The port turns upstream LLVM into cross-toolchains that produce static ELF
+executables for **Nanvix**, a Unix-like research operating system. The supported
+target triples are:
 
 ```
 i686-unknown-nanvix
+x86_64-unknown-nanvix
 ```
 
 The port has two kinds of changes. Most of the work lives in a small set of
@@ -36,8 +37,8 @@ The upstream integration points (kept as small as possible) are:
 - **Triple registration** — `llvm/lib/TargetParser/Triple.{h,cpp}` add the
   `Nanvix` OS type and map the `nanvix` triple component to it.
 - **Clang target info** — `clang/lib/Basic/Targets.cpp`, `Targets/OSTargets.h`,
-  and `Targets/X86.h` add the Nanvix target (defining `__nanvix__`/`__unix__`
-  and the x86-32/x86-64 type layouts).
+  and `Targets/X86.h` add the Nanvix targets (defining
+  `__nanvix__`/`__unix__` and the x86-32/x86-64 type layouts).
 - **Clang driver wiring** — `clang/lib/Driver/Driver.cpp` dispatches the triple
   to the toolchain, `Driver/CMakeLists.txt` builds it, and
   `Driver/ToolChains/CommonArgs.cpp` and `Lex/InitHeaderSearch.cpp` special-case
@@ -56,15 +57,16 @@ The `z` script (see `./z help`) builds the toolchain in two stages:
 
 ### Stage 0 — the compiler
 
-Builds Clang and LLD only, with `X86` as the sole target and the default triple
-pinned to `i686-unknown-nanvix`. No runtimes and no sysroot are required. The
-result is a Clang that already defaults to the Nanvix toolchain logic described
-below.
+Builds Clang and LLD only, with `X86` as the sole backend and the default triple
+selected by `./z configure --target` (`i686-nanvix` by default, or
+`x86_64-nanvix`). No runtimes and no sysroot are required. The result defaults
+to the selected Nanvix target while remaining able to compile for either triple
+explicitly.
 
 ### Stage 1 — the runtimes
 
-Uses the freshly built stage 0 Clang to cross-compile the LLVM runtimes for
-Nanvix:
+Uses the freshly built stage 0 Clang to cross-compile the LLVM runtimes for the
+same Nanvix target:
 
 - `compiler-rt` (builtins only — baremetal build, no sanitizers/profile/etc.)
 - `libunwind` (static and shared)
@@ -79,7 +81,16 @@ the in-source headers (`include/`), the C/math libraries (`libc.a`, `libm.a`,
 `libc.so`, `libm.so`), the startup objects (`crt0.o`, `libnvx_crt0.a`), the
 empty stub archives (`libdl.a`, `libpthread.a`, `librt.a`), and the user linker
 script (`user.ld`). The libc source is either a local Nanvix checkout
-(`Z_NANVIX_SRC`) or a downloaded Nanvix release tarball (`Z_NANVIX_RELEASE_TAG`).
+(`Z_NANVIX_SRC`) or a matching Nanvix release tarball
+(`Z_NANVIX_RELEASE_TAG`). The script validates `crt0.o`'s ELF class before
+staging it, so a 32-bit libc cannot silently enter an x86_64 sysroot (or vice
+versa). If the pinned release does not publish an x86_64 archive, build its
+source checkout first with:
+
+```bash
+make -C "$Z_NANVIX_SRC" nanvix-libc-bundle \
+  TARGET=x86_64 RELEASE=yes LOG_LEVEL=error
+```
 
 The in-source Nanvix libc has grown enough C and POSIX coverage that the stage 1
 libc++ is now built with its full default feature set — wide characters,
@@ -92,6 +103,8 @@ localization, and `<filesystem>` are all enabled.
 
 - **Defaults**: LLD is the linker, compiler-rt is the runtime library, libc++
   is the C++ standard library, and `math-errno` is off.
+- **x86_64 ABI**: the red zone is disabled by default because Nanvix exception
+  and signal delivery do not preserve it. Explicit `-mred-zone` still wins.
 - **Sysroot search**: both `$SYSROOT/lib` and `$SYSROOT/usr/lib` are searched so
   `crt0.o` and the archives resolve regardless of staging prefix. System C
   headers come from `$SYSROOT/usr/include`; libc++ headers come from
@@ -111,7 +124,10 @@ localization, and `<filesystem>` are all enabled.
   `-lc`.
 - **Shared objects**: `-shared` links emit no ELF interpreter (Nanvix has no
   dynamic loader; `.so`s are brought in via `dlopen`) and allow text
-  relocations.
+  relocations. Nanvix supplies PIC-built shared libc artifacts for x86_64.
+- **ELF64 self-linking**: x86_64 executable links use
+  `--apply-dynamic-relocs`, preserving ELF64 RELA entries while materializing
+  their link-time addends for Nanvix startup self-linking.
 
 ## The CMake platform module
 
@@ -140,12 +156,12 @@ $INSTALL/
 ├── bin/             # clang, clang++, lld, ...
 └── lib/
     ├── libc++.{a,so*}, libc++abi.{a,so*}, libunwind.{a,so*}
-    └── clang/<ver>/lib/i686-unknown-nanvix/libclang_rt.builtins*.a
+  └── clang/<ver>/lib/<triple>/libclang_rt.builtins*.a
 ```
 
 ## Tests
 
-`tests/smoke/` contains build-only smoke tests exercised by `./z test`:
+`.nanvix/tests/smoke/` contains build-only smoke tests exercised by `./z test`:
 
 - `hello.c` — a minimal C program (libc + compiler-rt).
 - `hello.cpp` — a minimal C++ program exercising `new`/`delete` (libc++abi) and
@@ -155,24 +171,28 @@ $INSTALL/
 - `dynamic.cpp` — a C++ executable linked against `libhello.so` and the shared
   libc++, libc++abi, and libunwind runtimes.
 
-`./z test` compiles and links all four for `i686-unknown-nanvix` using the
-installed toolchain (it does not run them). The dynamic test names the versioned
-runtime shared objects explicitly and brackets them with `-Bdynamic`/`-Bstatic`
-so the driver cannot fall back to archives while the default system libraries
-remain static. The executable uses Nanvix's established PIE self-linking flags,
-including SysV hashing and no `PT_INTERP`. `./z verify` checks that the expected
-static and shared runtime artifacts were installed.
+`./z test` compiles and links all four for the configured target using the
+installed toolchain (it does not run them). The dynamic test names the
+versioned runtime shared objects explicitly and brackets them with
+`-Bdynamic`/`-Bstatic` so the driver cannot fall back to archives while the
+default system libraries remain static. The executable uses Nanvix's
+self-linking flags, including SysV hashing and no `PT_INTERP`; the x86_64 link
+also materializes ELF64 RELA addends. `./z verify` checks the configured
+target's compiler-rt directory and the expected static/shared runtime artifacts.
 
 ## Building the toolchain
 
-From the repository root:
+From the repository root, choose `i686-nanvix` or `x86_64-nanvix` and use the
+same target for both stages:
 
 ```bash
+TARGET=x86_64-nanvix
+
 ./z setup                       # install host build dependencies (Ubuntu)
-./z configure --stage=0         # configure the compiler
+./z configure --target="$TARGET" --stage=0
 ./z build                       # build Clang + LLD
 ./z install                     # install stage 0
-./z configure --stage=1         # configure the runtimes
+./z configure --target="$TARGET" --stage=1
 ./z build                       # build the runtimes
 ./z install                     # install stage 1
 ./z verify                      # check installed artifacts
@@ -221,9 +241,9 @@ release you are building with.
 - **No system dynamic loader (executables are static ELF only)**.
   The driver forces `-Bstatic`, emits no ELF interpreter (`--no-dynamic-linker`
   on `-shared` links), and suppresses `RELRO`/build-id/rosegment. Shared runtime
-  libraries can be loaded explicitly with `dlopen`, and Nanvix has i686 startup
-  self-linking of an executable's `DT_NEEDED` dependencies, but no `PT_INTERP`
-  system dynamic linker.
+  libraries can be loaded explicitly with `dlopen`, and both x86 ports have
+  startup self-linking of an executable's `DT_NEEDED` dependencies, but no
+  `PT_INTERP` system dynamic linker.
   *Change once*: the Nanvix startup dynamic-linking epic lands
   ([nanvix/nanvix#2782](https://github.com/nanvix/nanvix/issues/2782), driver
   item [#2771](https://github.com/nanvix/nanvix/issues/2771)) — then add an

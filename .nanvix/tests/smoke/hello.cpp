@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 // Build smoke test: verify that a C++ program compiles and links against
-// libc++, libc++abi, libunwind, and compiler-rt for the i686-unknown-nanvix
+// libc++, libc++abi, libunwind, and compiler-rt for the configured Nanvix
 // target. Exercises new/delete (libc++abi) and std::printf (libc).
 
 #include <cstdio>

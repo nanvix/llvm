@@ -9,6 +9,10 @@ description: >
   its environment.
 
 inputs:
+  target:
+    description: Nanvix target architecture to build.
+    required: false
+    default: i686-nanvix
   install-location:
     description: Directory where LLVM (and the staged sysroot) is installed.
     required: true
@@ -41,10 +45,36 @@ runs:
       shell: bash
       run: sudo ./z setup
 
+    # The pinned Nanvix release currently publishes an i686 sysroot archive.
+    # Its source tag also supports x86_64, so build the equivalent libc bundle
+    # from that exact tag until an x86_64 release archive is available.
+    - name: Build Nanvix x86_64 libc bundle
+      if: inputs.target == 'x86_64-nanvix'
+      shell: bash
+      run: |
+        set -euo pipefail
+        nanvix_tag="${Z_NANVIX_RELEASE_TAG:-$(
+          sed -n 's/^readonly NANVIX_RELEASE_TAG="${Z_NANVIX_RELEASE_TAG:-\([^}]*\)}"$/\1/p' z
+        )}"
+        if [[ -z "${nanvix_tag}" ]]; then
+          echo "Failed to read NANVIX_RELEASE_TAG from z" >&2
+          exit 1
+        fi
+
+        nanvix_src="${RUNNER_TEMP}/nanvix-${nanvix_tag}-x86_64"
+        git clone --depth 1 --branch "${nanvix_tag}" \
+          https://github.com/nanvix/nanvix.git "${nanvix_src}"
+        make -C "${nanvix_src}" nanvix-libc-bundle \
+          TARGET=x86_64 RELEASE=yes LOG_LEVEL=error -j"$(nproc)"
+        echo "Z_NANVIX_SRC=${nanvix_src}" >> "${GITHUB_ENV}"
+
     # Stage 0: build and install the Clang/LLD compiler (no runtimes, no libc).
     - name: Configure LLVM (stage 0)
       shell: bash
-      run: ./z configure --install-location=${{ inputs.install-location }} --stage=0
+      env:
+        INSTALL_LOCATION: ${{ inputs.install-location }}
+        TARGET: ${{ inputs.target }}
+      run: ./z configure --install-location="${INSTALL_LOCATION}" --target="${TARGET}" --stage=0
 
     - name: Build LLVM (stage 0)
       shell: bash
@@ -65,10 +95,12 @@ runs:
       env:
         INSTALL_LOCATION: ${{ inputs.install-location }}
         RELEASE_NAME: ${{ inputs.release-name }}
+        TARGET: ${{ inputs.target }}
       run: |
         args=(
           --install-location="${INSTALL_LOCATION}"
           --sysroot-location="${INSTALL_LOCATION}"
+          --target="${TARGET}"
           --stage=1
         )
         if [[ -n "${RELEASE_NAME}" ]]; then
